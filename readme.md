@@ -112,7 +112,7 @@ https://github.com/Kanda-Akihito-Kun/ccb
 
 ## Fork 地址
 
-https://github.com/maxzrb/ccb
+https://github.com/maxzrb/bilibiliccb
 
 ---
 
