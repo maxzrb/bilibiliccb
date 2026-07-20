@@ -3,7 +3,7 @@
 > **这是 [原项目](https://github.com/Kanda-Akihito-Kun/ccb) 的 Fork 版本。**
 >
 > 原作者：[鼠鼠今天吃嘉然](https://space.bilibili.com/3220012)（[Kanda-Akihito-Kun](https://github.com/Kanda-Akihito-Kun)）
-> Fork 作者：[AreithDream](https://github.com/AreithDream)
+> Fork 作者：AreithDream（[maxzrb](https://github.com/maxzrb)）
 >
 > **Fork 版主要改进见下方「Fork 更新」章节。**
 
@@ -112,7 +112,7 @@ https://github.com/Kanda-Akihito-Kun/ccb
 
 ## Fork 地址
 
-https://github.com/AreithDream/ccb
+https://github.com/maxzrb/ccb
 
 ---
 
