@@ -59,6 +59,7 @@
     const powerModeStored = 'powerMode'
     const liveModeStored = 'liveMode'
     const ispFilterStored = 'CCB_ispFilter'
+    const STUCK_TIMEOUT_KEY = 'CCB_stuckTimeout'
 
     // ====== ISP 识别工具 ======
     // CDN 节点名中的运营商标记: ct=电信, cu=联通, cm/cmcc=移动
@@ -1475,6 +1476,37 @@
         actions.appendChild(applyBtn)
         body.appendChild(actions)
 
+        // 起播超时设置
+        const stuckRow = document.createElement('div')
+        stuckRow.style.cssText = 'display:flex;align-items:center;gap:8px;margin-top:10px;padding:8px;background:rgba(255,255,255,.04);border-radius:8px'
+        const stuckLabel = document.createElement('span')
+        stuckLabel.textContent = '⏱ 起播超时'
+        stuckLabel.style.cssText = 'color:#bbb;font-size:11px;white-space:nowrap'
+        const stuckInput = document.createElement('input')
+        stuckInput.type = 'number'
+        stuckInput.min = 1
+        stuckInput.max = 30
+        stuckInput.value = GM_getValue(STUCK_TIMEOUT_KEY, 3)
+        stuckInput.style.cssText = 'width:40px;background:#111;color:#fff;border:1px solid #333;border-radius:6px;padding:4px 6px;font-size:12px;text-align:center'
+        const stuckUnit = document.createElement('span')
+        stuckUnit.textContent = '秒'
+        stuckUnit.style.cssText = 'color:#888;font-size:11px'
+        const stuckHint = document.createElement('span')
+        stuckHint.textContent = '⚠ 设太低(<2s)可能误杀正常节点'
+        stuckHint.style.cssText = 'color:#f90;font-size:10px;flex:1'
+        stuckInput.addEventListener('change', () => {
+            let v = parseInt(stuckInput.value) || 3
+            if (v < 1) v = 1
+            stuckInput.value = v
+            GM_setValue(STUCK_TIMEOUT_KEY, v)
+            stuckHint.textContent = v < 2 ? '⚠ 极低！网络波动就可能误杀' : (v < 3 ? '⚠ 偏低，可能误杀' : '')
+        })
+        stuckRow.appendChild(stuckLabel)
+        stuckRow.appendChild(stuckInput)
+        stuckRow.appendChild(stuckUnit)
+        stuckRow.appendChild(stuckHint)
+        body.appendChild(stuckRow)
+
         document.documentElement.appendChild(root)
     }
 
@@ -1486,56 +1518,121 @@
         GM_registerMenuCommand(`📺CCB (${mainNodeName} | ${liveNodeName} | ${diagnosticsNodeName})`, () => { openPanel() })
         GM_registerMenuCommand('阅读文档 | 建议反馈 | 版本回退', () => { window.open('https://github.com/Kanda-Akihito-Kun/ccb') })
 
-        // ====== 自动故障转移：监听 B 站播放器报错 ======
+        // ====== 自动故障转移：3s 未起播即判定失败 + 报错浮层兜底 ======
         const FAILOVER_COOLDOWN_KEY = 'CCB_failover_cooldown'
         const failoverCooldown = () => {
             const last = GM_getValue(FAILOVER_COOLDOWN_KEY, 0)
-            if (Date.now() - last < 30000) return true  // 30s 冷却，防止循环
+            if (Date.now() - last < 30000) return true
             GM_setValue(FAILOVER_COOLDOWN_KEY, Date.now())
             return false
         }
 
-        const tryAutoFailover = async (ctx) => {
+        let failoverTriggered = false
+        const tryAutoFailover = (reason) => {
+            if (failoverTriggered) return
             if (failoverCooldown()) return
+            const ctx = isLiveContext() ? 'live' : (isDiagnosticsContext() ? 'diagnostics' : 'main')
             const curNode = getTargetCdnNode(ctx)
             if (curNode === defaultCdnNode) return
-            const curRegion = getRegion(ctx)
-            if (curRegion === manualRegionName) return
+            if (getRegion(ctx) === manualRegionName) return
+
+            failoverTriggered = true
 
             // 标记当前节点失败
             addFailCount(curNode)
             const fc = getNodeFailCount(curNode)
-            logger(`🚫 自动拉黑: ${curNode.split('.')[0]} (×${fc})`)
+            logger(`🚫 自动拉黑 (${reason}): ${curNode.split('.')[0]} (×${fc})`)
 
             // 找下一个可用节点
+            const curRegion = getRegion(ctx)
             const allNodes = (cdnDataCache && cdnDataCache[curRegion]) || (EMBEDDED.cdn && EMBEDDED.cdn[curRegion]) || []
             const candidates = allNodes.filter(n => {
                 if (n === curNode) return false
                 if (getNodeFailCount(n) >= 2) return false
                 return true
             })
+            candidates.sort((a, b) => (speedTestCache[a] || 9999) - (speedTestCache[b] || 9999))
 
             if (candidates.length > 0) {
-                // 有缓存延迟就用延迟排序
-                candidates.sort((a, b) => {
-                    const la = speedTestCache[a] || 9999
-                    const lb = speedTestCache[b] || 9999
-                    return la - lb
-                })
                 const next = candidates[0]
                 logger(`🔄 自动切换: ${curNode.split('.')[0]} → ${next.split('.')[0]}`)
                 setTargetCdnNode(ctx, next)
             } else {
-                // 无可用节点，回退默认
                 logger('🔄 无可用节点，回退默认源')
                 setTargetCdnNode(ctx, defaultCdnNode)
             }
-
-            // 短暂延迟后刷新，让用户看到通知
-            setTimeout(() => { location.reload() }, 1500)
+            setTimeout(() => { location.reload() }, 1000)
         }
 
-        // B站播放器报错特征：错误码出现在 .bilibili-player-video-error 或 toast 中
+        // ---- 机制 1：监听 <video> 元素，超时未起播即判定失败 ----
+        const getStuckTimeout = () => GM_getValue(STUCK_TIMEOUT_KEY, 3) * 1000  // 默认 3s
+        let videoWatchStarted = false
+
+        const isVideoPlaying = (v) => {
+            return v && !v.paused && v.readyState >= 2 && v.currentTime > 0
+        }
+
+        const checkVideoStuck = (video, startTime) => {
+            if (failoverTriggered) return
+            const timeout = getStuckTimeout()
+            const elapsed = Date.now() - startTime
+            if (elapsed < timeout) {
+                if (isVideoPlaying(video)) {
+                    logger('✅ 视频已起播，取消故障检测')
+                    return  // 起播成功，取消检测
+                }
+                // 还没到 3s，继续等待
+                setTimeout(() => checkVideoStuck(video, startTime), 500)
+                return
+            }
+            // 超过 3s 仍未起播
+            if (!isVideoPlaying(video)) {
+                logger(`⚠️ 视频 ${elapsed}ms 未起播 (readyState=${video.readyState}, paused=${video.paused}, currentTime=${video.currentTime})`)
+                tryAutoFailover('3s未起播')
+            }
+        }
+
+        const watchVideoElements = () => {
+            if (videoWatchStarted || failoverTriggered) return
+            // 只对主站视频页生效
+            if (location.host !== mainHost && location.host !== liveHost) return
+            if (!isCcbEnabled()) return
+
+            const videos = document.querySelectorAll('video')
+            for (const v of videos) {
+                if (v.src && v.src.indexOf(getReplacementHost()) !== -1) {
+                    videoWatchStarted = true
+                    logger('检测到 CDN 视频元素，启动 3s 起播检测')
+                    setTimeout(() => checkVideoStuck(v, Date.now()), 1000)  // 给播放器 1s 初始化
+                    return
+                }
+                // B站播放器可能用 blob URL，检查 src 是否包含 bilivideo
+                if (v.src && (v.src.indexOf('bilivideo') !== -1 || v.src.indexOf('akamaized') !== -1)) {
+                    videoWatchStarted = true
+                    logger('检测到视频元素，启动 3s 起播检测')
+                    setTimeout(() => checkVideoStuck(v, Date.now()), 1000)
+                    return
+                }
+            }
+        }
+
+        // 用 MutationObserver 监听 <video> 元素的出现
+        const videoObserver = new MutationObserver(() => {
+            watchVideoElements()
+            // 同时检查报错浮层
+            checkErrorOverlay()
+        })
+        try {
+            videoObserver.observe(document.documentElement, { childList: true, subtree: true })
+        } catch (_) {}
+
+        // 定时轮询兜底
+        const pollInterval = setInterval(() => {
+            watchVideoElements()
+            checkErrorOverlay()
+        }, 2000)
+
+        // ---- 机制 2：报错浮层兜底（错误码/网络异常提示） ----
         const ERROR_SELECTORS = [
             '.bilibili-player-video-error',
             '.bpx-player-error-feedback',
@@ -1544,37 +1641,23 @@
         ]
         const ERROR_TEXT_PATTERNS = /错误码|网络状况异常|视频加载失败|请求错误|4\d{3}|无法播放/i
 
-        let failoverChecked = false
-        const checkForPlaybackError = () => {
-            if (failoverChecked) return
+        const checkErrorOverlay = () => {
+            if (failoverTriggered) return
             for (const sel of ERROR_SELECTORS) {
                 const el = document.querySelector(sel)
-                if (el && el.offsetParent !== null) {  // 可见
+                if (el && el.offsetParent !== null) {
                     const text = el.textContent || ''
                     if (ERROR_TEXT_PATTERNS.test(text)) {
-                        failoverChecked = true
                         logger('检测到播放器报错:', text.substring(0, 80))
-                        const ctx = isLiveContext() ? 'live' : (isDiagnosticsContext() ? 'diagnostics' : 'main')
-                        tryAutoFailover(ctx)
+                        tryAutoFailover('播放器报错')
                         return
                     }
                 }
             }
         }
 
-        // DOM 观察 + 定时轮询（播放器可能异步加载）
-        try {
-            const observer = new MutationObserver(() => { checkForPlaybackError() })
-            observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true })
-            // 定时兜底
-            setInterval(() => { checkForPlaybackError() }, 3000)
-            // 页面加载完成后检查一次
-            if (document.readyState === 'complete') {
-                setTimeout(() => { checkForPlaybackError() }, 2000)
-            } else {
-                window.addEventListener('load', () => { setTimeout(() => { checkForPlaybackError() }, 2000) })
-            }
-        } catch (_) {}
+        // 页面加载后也检查一次
+        setTimeout(() => { watchVideoElements(); checkErrorOverlay() }, 2000)
         // ====== END 自动故障转移 ======
     }
 
