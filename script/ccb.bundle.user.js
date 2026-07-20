@@ -614,7 +614,7 @@ const EMBEDDED = {
         "cn-hljheb-ct-01-07.bilivideo.com"
     ]
 },
-    buildTime: "2026-07-20T16:06:42Z"
+    buildTime: "2026-07-20T16:23:02Z"
 };
 // ===EMBEDDED_END===
     // API 源列表，按优先级排列 — jsDelivr 国内可访问，GitHub Pages 作为备用
@@ -823,6 +823,31 @@ const EMBEDDED = {
 
     // 保存最近的真实视频分片路径，用于 CDN 内容验活
     let videoProbePath = null  // { path: '/upgcxcode/...', host: 'cn-xxx.bilivideo.com' }
+
+    // 主动从页面全局变量中采集视频探针路径
+    const collectProbePath = () => {
+        if (videoProbePath && videoProbePath.path) return
+        const scanObj = (obj, depth) => {
+            if (!obj || typeof obj !== 'object' || depth > 8) return
+            if (Array.isArray(obj)) {
+                for (const item of obj) scanObj(item, depth + 1)
+                return
+            }
+            for (const k in obj) {
+                if (!Object.prototype.hasOwnProperty.call(obj, k)) continue
+                const v = obj[k]
+                if (typeof v === 'string' && hasMediaDomain(v)) {
+                    const probe = extractVideoPath(v)
+                    if (probe) { videoProbePath = probe; return }
+                } else if (typeof v === 'object') {
+                    scanObj(v, depth + 1)
+                    if (videoProbePath) return
+                }
+            }
+        }
+        try { scanObj(unsafeWindow.__playinfo__, 0) } catch (_) {}
+        try { scanObj(unsafeWindow.__INITIAL_STATE__, 0) } catch (_) {}
+    }
 
     const extractVideoPath = (urlStr) => {
         if (typeof urlStr !== 'string') return null
@@ -1873,6 +1898,7 @@ const EMBEDDED = {
                     })
 
                     // 第 2 步：内容验活
+                    collectProbePath()  // 主动从页面全局变量采集，避免因时序问题漏掉
                     if (videoProbePath && videoProbePath.path) {
                         summaryLabel.textContent = '🔍 验活...'
                         const probeResults = await probeTopNodes(sorted, 10, (done, total, last) => {
