@@ -1519,18 +1519,9 @@
         GM_registerMenuCommand('阅读文档 | 建议反馈 | 版本回退', () => { window.open('https://github.com/Kanda-Akihito-Kun/ccb') })
 
         // ====== 自动故障转移：3s 未起播即判定失败 + 报错浮层兜底 ======
-        const FAILOVER_COOLDOWN_KEY = 'CCB_failover_cooldown'
-        const failoverCooldown = () => {
-            const last = GM_getValue(FAILOVER_COOLDOWN_KEY, 0)
-            if (Date.now() - last < 30000) return true
-            GM_setValue(FAILOVER_COOLDOWN_KEY, Date.now())
-            return false
-        }
-
         let failoverTriggered = false
         const tryAutoFailover = (reason) => {
             if (failoverTriggered) return
-            if (failoverCooldown()) return
             const ctx = isLiveContext() ? 'live' : (isDiagnosticsContext() ? 'diagnostics' : 'main')
             const curNode = getTargetCdnNode(ctx)
             if (curNode === defaultCdnNode) return
