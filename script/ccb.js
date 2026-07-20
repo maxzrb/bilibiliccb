@@ -1315,13 +1315,15 @@
                 banBtn.title = '当前节点播放失败？点击标记，下次测速自动跳过'
                 banBtn.className = 'ccb-ban-btn'
                 banBtn.style.cssText = 'display:none;border:0;border-radius:4px;padding:2px 6px;cursor:pointer;color:#fff;background:#600;font-size:11px'
-                banBtn.addEventListener('click', () => {
+                banBtn.addEventListener('click', async () => {
                     const cur = getTargetCdnNode(ctx)
                     if (cur === defaultCdnNode) return
                     addFailCount(cur)
                     const fc = getNodeFailCount(cur)
-                    summaryLabel.innerHTML = `<span style="color:#f60">🚫 已标记 ${cur.split('.')[0]} (×${fc})，下次测速自动跳过</span>`
+                    summaryLabel.innerHTML = `<span style="color:#f60">🚫 已标记 ${cur.split('.')[0]} (×${fc})，已从列表移除</span>`
                     banBtn.style.display = 'none'
+                    // 刷新所有三栏的下拉框，移除拉黑节点
+                    ispRefreshCallbacks.forEach(fn => { try { fn() } catch (_) {} })
                 })
                 speedBtnRow.appendChild(banBtn)
                 // 初始显示状态
