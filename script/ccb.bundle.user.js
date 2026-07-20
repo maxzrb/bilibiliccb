@@ -615,7 +615,7 @@ const EMBEDDED = {
         "cn-hljheb-ct-01-07.bilivideo.com"
     ]
 },
-    buildTime: "2026-07-20T16:53:07Z"
+    buildTime: "2026-07-20T16:55:17Z"
 };
 // ===EMBEDDED_END===
     // API 源列表，按优先级排列 — jsDelivr 国内可访问，GitHub Pages 作为备用
@@ -1423,9 +1423,11 @@ const EMBEDDED = {
         const data = await getCdnData()
         const regionData = (data && data[region]) || []
         const isp = getIspFilter()
-        const filtered = isp !== '全部'
+        let filtered = isp !== '全部'
             ? regionData.filter(n => detectIsp(n) === isp)
             : regionData
+        // 过滤拉黑节点（失败 ≥2 次），×1 的节点保留（给第二次机会）
+        filtered = filtered.filter(n => getNodeFailCount(n) < 2)
         // 排序：优先同运营商
         return [defaultCdnNode, ...sortByIsp(filtered, isp !== '全部' ? isp : null)]
     }
@@ -1691,7 +1693,8 @@ const EMBEDDED = {
 
             // 每个地区抽最多 3 个代表节点（优先不同 ISP）
             const pickRepNodes = (regionName) => {
-                const nodes = (cdnDataCache && cdnDataCache[regionName]) || (EMBEDDED.cdn && EMBEDDED.cdn[regionName]) || []
+                let nodes = (cdnDataCache && cdnDataCache[regionName]) || (EMBEDDED.cdn && EMBEDDED.cdn[regionName]) || []
+                nodes = nodes.filter(n => getNodeFailCount(n) < 2)  // 跳过拉黑节点
                 if (nodes.length === 0) return []
                 const ispSet = new Set()
                 const picked = []
@@ -2089,6 +2092,71 @@ const EMBEDDED = {
         stuckRow.appendChild(stuckHint)
         body.appendChild(stuckRow)
 
+        // 黑名单管理
+        const banListBox = document.createElement('div')
+        banListBox.style.cssText = 'margin-top:8px;padding:8px;background:rgba(255,255,255,.04);border-radius:8px;display:none'
+
+        const renderBanList = () => {
+            banListBox.innerHTML = ''
+            const fc = getFailCount()
+            const entries = Object.entries(fc).filter(([,c]) => c >= 1).sort(([,a], [,b]) => b - a)
+            if (entries.length === 0) {
+                banListBox.innerHTML = '<div style="color:#888;font-size:11px;padding:4px">暂无拉黑节点</div>'
+            } else {
+                entries.forEach(([node, count]) => {
+                    const row = document.createElement('div')
+                    row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:2px 0;font-size:11px'
+                    const nameSpan = document.createElement('span')
+                    nameSpan.textContent = node.split('.')[0]
+                    nameSpan.style.cssText = 'color:#888;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1'
+                    const countSpan = document.createElement('span')
+                    countSpan.textContent = `×${count}`
+                    countSpan.style.cssText = 'color:#f66;margin:0 8px'
+                    const releaseBtn = document.createElement('button')
+                    releaseBtn.textContent = '放出'
+                    releaseBtn.style.cssText = 'border:0;border-radius:3px;padding:1px 6px;cursor:pointer;color:#0f0;background:#030;font-size:10px'
+                    releaseBtn.addEventListener('click', () => {
+                        const fc2 = getFailCount()
+                        delete fc2[node]
+                        GM_setValue(failCountStored, JSON.stringify(fc2))
+                        renderBanList()
+                        if (Object.keys(getFailCount()).length === 0) banListBox.style.display = 'none'
+                    })
+                    row.appendChild(nameSpan)
+                    row.appendChild(countSpan)
+                    row.appendChild(releaseBtn)
+                    banListBox.appendChild(row)
+                })
+            }
+            // 标题+清空按钮
+            const headerRow = document.createElement('div')
+            headerRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;border-bottom:1px solid #333;padding-bottom:4px'
+            headerRow.innerHTML = '<span style="color:#f66;font-size:11px;font-weight:700">🚫 黑名单</span>'
+            const clearBtn = document.createElement('button')
+            clearBtn.textContent = '清空全部'
+            clearBtn.style.cssText = 'border:0;border-radius:4px;padding:3px 8px;cursor:pointer;color:#fff;background:#600;font-size:10px'
+            clearBtn.addEventListener('click', () => {
+                GM_setValue(failCountStored, '{}')
+                banListBox.style.display = 'none'
+            })
+            headerRow.appendChild(clearBtn)
+            banListBox.insertBefore(headerRow, banListBox.firstChild)
+        }
+
+        const toggleBanBtn = document.createElement('button')
+        toggleBanBtn.textContent = '🚫 黑名单'
+        toggleBanBtn.style.cssText = 'border:0;border-radius:6px;padding:5px 10px;cursor:pointer;color:#f66;background:transparent;font-size:11px;margin-left:4px'
+        toggleBanBtn.addEventListener('click', () => {
+            if (banListBox.style.display === 'none') {
+                renderBanList()
+                banListBox.style.display = 'block'
+            } else {
+                banListBox.style.display = 'none'
+            }
+        })
+        actions.appendChild(toggleBanBtn)
+        body.appendChild(banListBox)
+
         document.documentElement.appendChild(root)
     }
 
@@ -2121,7 +2189,7 @@ const EMBEDDED = {
             const allNodes = (cdnDataCache && cdnDataCache[curRegion]) || (EMBEDDED.cdn && EMBEDDED.cdn[curRegion]) || []
             const candidates = allNodes.filter(n => {
                 if (n === curNode) return false
-                if (getNodeFailCount(n) >= 2) return false
+                if (getNodeFailCount(n) >= 1) return false
                 return true
             })
             candidates.sort((a, b) => (speedTestCache[a] || 9999) - (speedTestCache[b] || 9999))
