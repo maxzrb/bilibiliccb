@@ -1485,6 +1485,97 @@
         const liveNodeName = stripNodeSuffix(getTargetCdnNode('live'))
         GM_registerMenuCommand(`📺CCB (${mainNodeName} | ${liveNodeName} | ${diagnosticsNodeName})`, () => { openPanel() })
         GM_registerMenuCommand('阅读文档 | 建议反馈 | 版本回退', () => { window.open('https://github.com/Kanda-Akihito-Kun/ccb') })
+
+        // ====== 自动故障转移：监听 B 站播放器报错 ======
+        const FAILOVER_COOLDOWN_KEY = 'CCB_failover_cooldown'
+        const failoverCooldown = () => {
+            const last = GM_getValue(FAILOVER_COOLDOWN_KEY, 0)
+            if (Date.now() - last < 30000) return true  // 30s 冷却，防止循环
+            GM_setValue(FAILOVER_COOLDOWN_KEY, Date.now())
+            return false
+        }
+
+        const tryAutoFailover = async (ctx) => {
+            if (failoverCooldown()) return
+            const curNode = getTargetCdnNode(ctx)
+            if (curNode === defaultCdnNode) return
+            const curRegion = getRegion(ctx)
+            if (curRegion === manualRegionName) return
+
+            // 标记当前节点失败
+            addFailCount(curNode)
+            const fc = getNodeFailCount(curNode)
+            logger(`🚫 自动拉黑: ${curNode.split('.')[0]} (×${fc})`)
+
+            // 找下一个可用节点
+            const allNodes = (cdnDataCache && cdnDataCache[curRegion]) || (EMBEDDED.cdn && EMBEDDED.cdn[curRegion]) || []
+            const candidates = allNodes.filter(n => {
+                if (n === curNode) return false
+                if (getNodeFailCount(n) >= 2) return false
+                return true
+            })
+
+            if (candidates.length > 0) {
+                // 有缓存延迟就用延迟排序
+                candidates.sort((a, b) => {
+                    const la = speedTestCache[a] || 9999
+                    const lb = speedTestCache[b] || 9999
+                    return la - lb
+                })
+                const next = candidates[0]
+                logger(`🔄 自动切换: ${curNode.split('.')[0]} → ${next.split('.')[0]}`)
+                setTargetCdnNode(ctx, next)
+            } else {
+                // 无可用节点，回退默认
+                logger('🔄 无可用节点，回退默认源')
+                setTargetCdnNode(ctx, defaultCdnNode)
+            }
+
+            // 短暂延迟后刷新，让用户看到通知
+            setTimeout(() => { location.reload() }, 1500)
+        }
+
+        // B站播放器报错特征：错误码出现在 .bilibili-player-video-error 或 toast 中
+        const ERROR_SELECTORS = [
+            '.bilibili-player-video-error',
+            '.bpx-player-error-feedback',
+            '.bpx-player-error',
+            '[class*="player-error"]',
+        ]
+        const ERROR_TEXT_PATTERNS = /错误码|网络状况异常|视频加载失败|请求错误|4\d{3}|无法播放/i
+
+        let failoverChecked = false
+        const checkForPlaybackError = () => {
+            if (failoverChecked) return
+            for (const sel of ERROR_SELECTORS) {
+                const el = document.querySelector(sel)
+                if (el && el.offsetParent !== null) {  // 可见
+                    const text = el.textContent || ''
+                    if (ERROR_TEXT_PATTERNS.test(text)) {
+                        failoverChecked = true
+                        logger('检测到播放器报错:', text.substring(0, 80))
+                        const ctx = isLiveContext() ? 'live' : (isDiagnosticsContext() ? 'diagnostics' : 'main')
+                        tryAutoFailover(ctx)
+                        return
+                    }
+                }
+            }
+        }
+
+        // DOM 观察 + 定时轮询（播放器可能异步加载）
+        try {
+            const observer = new MutationObserver(() => { checkForPlaybackError() })
+            observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true })
+            // 定时兜底
+            setInterval(() => { checkForPlaybackError() }, 3000)
+            // 页面加载完成后检查一次
+            if (document.readyState === 'complete') {
+                setTimeout(() => { checkForPlaybackError() }, 2000)
+            } else {
+                window.addEventListener('load', () => { setTimeout(() => { checkForPlaybackError() }, 2000) })
+            }
+        } catch (_) {}
+        // ====== END 自动故障转移 ======
     }
 
     logger('CCB 加载完成', { host: location.host, path: location.pathname })
