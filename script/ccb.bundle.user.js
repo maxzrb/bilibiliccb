@@ -615,7 +615,7 @@ const EMBEDDED = {
         "cn-hljheb-ct-01-07.bilivideo.com"
     ]
 },
-    buildTime: "2026-07-20T16:30:33Z"
+    buildTime: "2026-07-20T16:34:33Z"
 };
 // ===EMBEDDED_END===
     // API 源列表，按优先级排列 — jsDelivr 国内可访问，GitHub Pages 作为备用
@@ -845,26 +845,61 @@ const EMBEDDED = {
     }
 
     const collectProbePath = async () => {
-        if (videoProbePath && videoProbePath.path) return
+        if (videoProbePath && videoProbePath.path) {
+            logger('验活: 已有探针路径', videoProbePath.path.substring(0, 60))
+            return
+        }
 
         // 1. 扫页面全局变量
         try { scanObjForMediaUrl(unsafeWindow.__playinfo__, 0) } catch (_) {}
+        if (videoProbePath) { logger('验活: 从 __playinfo__ 采到探针'); return }
         try { scanObjForMediaUrl(unsafeWindow.__INITIAL_STATE__, 0) } catch (_) {}
-        if (videoProbePath) return
+        if (videoProbePath) { logger('验活: 从 __INITIAL_STATE__ 采到探针'); return }
 
-        // 2. 兜底：从当前页面 URL 提取 bvid，主动请求 playurl API 拿视频地址
-        const m = location.pathname.match(/\/(video|bangumi\/play)\/(BV[\w]+|ep\d+)/)
-        if (!m) return
+        // 2. 检查是否在视频页
+        const pathname = location.pathname
+        const bvMatch = pathname.match(/\/video\/(BV[\w]+)/)
+        const epMatch = pathname.match(/\/bangumi\/play\/(ep\d+)/)
+        if (!bvMatch && !epMatch) {
+            logger('验活: 非视频页，跳过探针采集')
+            return
+        }
+
+        // 3. 提取 cid（尝试多种路径）
         let cid = null
-        try { cid = unsafeWindow.__INITIAL_STATE__?.videoData?.cid } catch (_) {}
-        if (!cid) try { cid = unsafeWindow.__INITIAL_STATE__?.epInfo?.cid } catch (_) {}
-        if (!cid) return
-
-        const apiUrl = `https://api.bilibili.com/x/player/playurl?cid=${cid}&qn=0&fnval=1&fourk=1`
         try {
-            const resp = await requestJson(apiUrl)
-            scanObjForMediaUrl(resp, 0)
+            const st = unsafeWindow.__INITIAL_STATE__
+            if (st) {
+                cid = st?.videoData?.cid || st?.cid || st?.epInfo?.cid || st?.mediaInfo?.param?.cid
+                // 也尝试从 videoData.pages 中找
+                if (!cid && st?.videoData?.pages) {
+                    const pages = st.videoData.pages
+                    if (Array.isArray(pages) && pages.length > 0) cid = pages[0].cid
+                }
+            }
         } catch (_) {}
+        if (!cid) {
+            logger('验活: 未能提取 cid')
+            return
+        }
+        logger('验活: 提取到 cid=' + cid + '，请求 playurl API...')
+
+        // 4. 请求 playurl API（用 fetch，B站 API 支持 CORS）
+        const apiUrl = `https://api.bilibili.com/x/player/playurl?cid=${cid}&qn=0&fnval=4048&fourk=1`
+        try {
+            const resp = await fetch(apiUrl, { credentials: 'include' })
+            if (!resp.ok) { logger('验活: API 返回 ' + resp.status); return }
+            const data = await resp.json()
+            if (data.code !== 0) { logger('验活: API code=' + data.code); return }
+            scanObjForMediaUrl(data, 0)
+            if (videoProbePath) {
+                logger('验活: 从 API 采到探针', videoProbePath.path.substring(0, 60))
+            } else {
+                logger('验活: API 响应中未找到媒体 URL')
+            }
+        } catch (e) {
+            logger('验活: API 请求失败', e.message || e)
+        }
     }
 
     const extractVideoPath = (urlStr) => {
@@ -1950,7 +1985,7 @@ const EMBEDDED = {
                             ? '<span style="color:#0f0">✅ 有内容</span>'
                             : (best.hasContent === false
                                 ? '<span style="color:#f60">⚠️ 可能无内容</span>'
-                                : '<span style="color:#888">未验活</span>')
+                                : '<span style="color:#888" title="在视频播放页测速可验活内容">未验活</span>')
                         const failTag = fc > 0 ? `<span style="color:#f60"> 🚫×${fc}</span>` : ''
                         summaryLabel.innerHTML = `<span style="color:#0f0">✅ 已选:</span> <span style="color:#fff">${best.latency}ms</span> ${contentTag}${failTag} <span style="color:#888">${best.node.split('.')[0]}</span>`
                     } else {
