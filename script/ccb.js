@@ -18,6 +18,7 @@
 // @connect      kanda-akihito-kun.github.io
 // @connect      cdn.jsdelivr.net
 // @connect      raw.githubusercontent.com
+// @connect      api.bilibili.com
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -243,28 +244,45 @@
     let videoProbePath = null  // { path: '/upgcxcode/...', host: 'cn-xxx.bilivideo.com' }
 
     // 主动从页面全局变量中采集视频探针路径
-    const collectProbePath = () => {
-        if (videoProbePath && videoProbePath.path) return
-        const scanObj = (obj, depth) => {
-            if (!obj || typeof obj !== 'object' || depth > 8) return
-            if (Array.isArray(obj)) {
-                for (const item of obj) scanObj(item, depth + 1)
-                return
-            }
-            for (const k in obj) {
-                if (!Object.prototype.hasOwnProperty.call(obj, k)) continue
-                const v = obj[k]
-                if (typeof v === 'string' && hasMediaDomain(v)) {
-                    const probe = extractVideoPath(v)
-                    if (probe) { videoProbePath = probe; return }
-                } else if (typeof v === 'object') {
-                    scanObj(v, depth + 1)
-                    if (videoProbePath) return
-                }
+    const scanObjForMediaUrl = (obj, depth) => {
+        if (!obj || typeof obj !== 'object' || depth > 8 || videoProbePath) return
+        if (Array.isArray(obj)) {
+            for (const item of obj) scanObjForMediaUrl(item, depth + 1)
+            return
+        }
+        for (const k in obj) {
+            if (!Object.prototype.hasOwnProperty.call(obj, k)) continue
+            const v = obj[k]
+            if (typeof v === 'string' && hasMediaDomain(v)) {
+                const probe = extractVideoPath(v)
+                if (probe) { videoProbePath = probe; return }
+            } else if (typeof v === 'object') {
+                scanObjForMediaUrl(v, depth + 1)
             }
         }
-        try { scanObj(unsafeWindow.__playinfo__, 0) } catch (_) {}
-        try { scanObj(unsafeWindow.__INITIAL_STATE__, 0) } catch (_) {}
+    }
+
+    const collectProbePath = async () => {
+        if (videoProbePath && videoProbePath.path) return
+
+        // 1. 扫页面全局变量
+        try { scanObjForMediaUrl(unsafeWindow.__playinfo__, 0) } catch (_) {}
+        try { scanObjForMediaUrl(unsafeWindow.__INITIAL_STATE__, 0) } catch (_) {}
+        if (videoProbePath) return
+
+        // 2. 兜底：从当前页面 URL 提取 bvid，主动请求 playurl API 拿视频地址
+        const m = location.pathname.match(/\/(video|bangumi\/play)\/(BV[\w]+|ep\d+)/)
+        if (!m) return
+        let cid = null
+        try { cid = unsafeWindow.__INITIAL_STATE__?.videoData?.cid } catch (_) {}
+        if (!cid) try { cid = unsafeWindow.__INITIAL_STATE__?.epInfo?.cid } catch (_) {}
+        if (!cid) return
+
+        const apiUrl = `https://api.bilibili.com/x/player/playurl?cid=${cid}&qn=0&fnval=1&fourk=1`
+        try {
+            const resp = await requestJson(apiUrl)
+            scanObjForMediaUrl(resp, 0)
+        } catch (_) {}
     }
 
     const extractVideoPath = (urlStr) => {
@@ -1316,7 +1334,7 @@
                     })
 
                     // 第 2 步：内容验活
-                    collectProbePath()  // 主动从页面全局变量采集，避免因时序问题漏掉
+                    await collectProbePath()  // 主动采集 + API 兜底，确保有探针 URL
                     if (videoProbePath && videoProbePath.path) {
                         summaryLabel.textContent = '🔍 验活...'
                         const probeResults = await probeTopNodes(sorted, 10, (done, total, last) => {
