@@ -615,7 +615,7 @@ const EMBEDDED = {
         "cn-hljheb-ct-01-07.bilivideo.com"
     ]
 },
-    buildTime: "2026-07-20T16:59:27Z"
+    buildTime: "2026-07-20T17:03:19Z"
 };
 // ===EMBEDDED_END===
     // API 源列表，按优先级排列 — jsDelivr 国内可访问，GitHub Pages 作为备用
@@ -1426,8 +1426,8 @@ const EMBEDDED = {
         let filtered = isp !== '全部'
             ? regionData.filter(n => detectIsp(n) === isp)
             : regionData
-        // 过滤拉黑节点（失败 ≥2 次），×1 的节点保留（给第二次机会）
-        filtered = filtered.filter(n => getNodeFailCount(n) < 2)
+        // 过滤拉黑节点（失败 ≥1 次即跳过）
+        filtered = filtered.filter(n => getNodeFailCount(n) < 1)
         // 排序：优先同运营商
         return [defaultCdnNode, ...sortByIsp(filtered, isp !== '全部' ? isp : null)]
     }
@@ -1507,7 +1507,7 @@ const EMBEDDED = {
         if (contentOkCache[nodeName] !== undefined) {
             return resolve({ node: nodeName, hasContent: contentOkCache[nodeName] })
         }
-        if (getNodeFailCount(nodeName) >= 2) {
+        if (getNodeFailCount(nodeName) >= 1) {
             contentOkCache[nodeName] = false
             return resolve({ node: nodeName, hasContent: false })
         }
@@ -1694,7 +1694,7 @@ const EMBEDDED = {
             // 每个地区抽最多 3 个代表节点（优先不同 ISP）
             const pickRepNodes = (regionName) => {
                 let nodes = (cdnDataCache && cdnDataCache[regionName]) || (EMBEDDED.cdn && EMBEDDED.cdn[regionName]) || []
-                nodes = nodes.filter(n => getNodeFailCount(n) < 2)  // 跳过拉黑节点
+                nodes = nodes.filter(n => getNodeFailCount(n) < 1)  // 跳过拉黑节点
                 if (nodes.length === 0) return []
                 const ispSet = new Set()
                 const picked = []
@@ -1979,7 +1979,7 @@ const EMBEDDED = {
                     // 选最优
                     const rankNode = (r) => {
                         if (r.error) return 99
-                        if (getNodeFailCount(r.node) >= 2) return 98
+                        if (getNodeFailCount(r.node) >= 1) return 98
                         if (r.hasContent === true) return 1
                         if (r.hasContent === null) return 2
                         return 3
@@ -2204,7 +2204,7 @@ const EMBEDDED = {
                 logger('🔄 无可用节点，回退默认源')
                 setTargetCdnNode(ctx, defaultCdnNode)
             }
-            setTimeout(() => { location.reload() }, 1000)
+            setTimeout(() => { location.reload() }, 2000)
         }
 
         // ---- 机制 1：监听 <video> 元素，超时未起播即判定失败 ----
