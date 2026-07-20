@@ -912,7 +912,8 @@
     // 内容验活：用真实视频分片发 GET + Range 请求较大数据块 (8KB)
     // no-cors 模式下看不到状态码，用传输耗时做启发式判断：
     //   - 耗时 > 100ms：大概率有真实数据传输 → 有内容
-    //   - 耗时 < 100ms：大概率服务器秒回了 404/错误页面 → 无内容
+    // B站视频 URL 带节点绑定签名，换 host 后必然 403，所以验活改为测节点通用连通性：
+    // 去签名后发 HEAD 请求到视频路径，能响应（即使 403）说明节点在线且路径可路由
     const contentOkCache = {}  // { nodeName: true/false/null }
     const probeNodeContent = (nodeName) => new Promise((resolve) => {
         if (!videoProbePath || !videoProbePath.path) {
@@ -921,33 +922,34 @@
         if (contentOkCache[nodeName] !== undefined) {
             return resolve({ node: nodeName, hasContent: contentOkCache[nodeName] })
         }
-        // 有多次播放失败记录的节点直接判无内容
         if (getNodeFailCount(nodeName) >= 2) {
             contentOkCache[nodeName] = false
             return resolve({ node: nodeName, hasContent: false })
         }
 
-        const url = `https://${nodeName}${videoProbePath.path}`
+        // 去掉查询串（含节点绑定签名），只保留路径，避免 403 干扰判断
+        const cleanPath = videoProbePath.path.split('?')[0]
+        const url = `https://${nodeName}${cleanPath}`
         const ctrl = new AbortController()
         const timer = setTimeout(() => { ctrl.abort(); contentOkCache[nodeName] = false; resolve({ node: nodeName, hasContent: false }) }, 5000)
         const t0 = performance.now()
 
-        // 直接 GET 一个 8KB 数据块，凭传输耗时判断
         fetch(url, {
-            method: 'GET',
-            headers: { 'Range': 'bytes=0-8191' },
+            method: 'HEAD',
+            mode: 'no-cors',
             cache: 'no-store',
             credentials: 'omit',
             signal: ctrl.signal,
         }).then(() => {
             clearTimeout(timer)
             const elapsed = performance.now() - t0
-            // 8KB 数据在正常网络下一般 >100ms；秒回 <100ms 通常是无内容/报错
-            const ok = elapsed > 100
+            // 节点能响应（即使 403/404 也说明在线且路由正确），超时才是真死
+            const ok = elapsed < 4000  // 能连上就算 OK
             contentOkCache[nodeName] = ok
             resolve({ node: nodeName, hasContent: ok, latency: Math.round(elapsed) })
         }).catch(() => {
             clearTimeout(timer)
+            // fetch 失败（网络不可达），不是 CORS 错（no-cors 不会抛 CORS）
             contentOkCache[nodeName] = false
             resolve({ node: nodeName, hasContent: false })
         })
@@ -1372,13 +1374,17 @@
                     await collectProbePath()  // 主动采集 + API 兜底，确保有探针 URL
                     if (videoProbePath && videoProbePath.path) {
                         summaryLabel.textContent = '🔍 验活...'
-                        const probeResults = await probeTopNodes(sorted, 10, (done, total, last) => {
+                        const probeResults = await probeTopNodes(sorted, Math.min(20, sorted.length), (done, total, last) => {
                             summaryLabel.textContent = `🔍 验活 ${done}/${total}`
                         })
                         const probeMap = {}
                         probeResults.forEach(p => { probeMap[p.node] = p.hasContent })
                         sorted.forEach(s => {
-                            if (probeMap[s.node] !== undefined) s.hasContent = probeMap[s.node]
+                            if (probeMap[s.node] !== undefined) {
+                                s.hasContent = probeMap[s.node]
+                            } else {
+                                s.hasContent = false  // 超出验活范围的视为未确认
+                            }
                         })
                     }
 
@@ -1400,10 +1406,10 @@
                         selectNode(best.node)
                         const fc = getNodeFailCount(best.node)
                         const contentTag = best.hasContent === true
-                            ? '<span style="color:#0f0">✅ 有内容</span>'
+                            ? '<span style="color:#0f0">✅ 节点可达</span>'
                             : (best.hasContent === false
-                                ? '<span style="color:#f60">⚠️ 可能无内容</span>'
-                                : '<span style="color:#888" title="在视频播放页测速可验活内容">未验活</span>')
+                                ? '<span style="color:#f60">⚠️ 节点不通</span>'
+                                : '<span style="color:#888" title="在视频播放页测速可验连通性">未验活</span>')
                         const failTag = fc > 0 ? `<span style="color:#f60"> 🚫×${fc}</span>` : ''
                         summaryLabel.innerHTML = `<span style="color:#0f0">✅ 已选:</span> <span style="color:#fff">${best.latency}ms</span> ${contentTag}${failTag} <span style="color:#888">${best.node.split('.')[0]}</span>`
                     } else {
