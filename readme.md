@@ -32,15 +32,15 @@
 
 番剧需允许用户脚本在相关框架运行。受 DRM、授权、签名或播放器协议限制的请求会保留原生通道；本脚本不改变账号权限及播放授权。
 
-## 数据更新与 Actions
+## 数据更新与手动发布
 
-节点内嵌在安装脚本中，后台优先从本 Fork 的 jsDelivr、GitHub 原始文件及 Pages 更新，随后才尝试上游。有效数据缓存七天；线上失败时继续使用已有快照。
+节点内嵌在安装脚本中，后台优先从本 Fork 的 jsDelivr、GitHub 原始文件更新，随后尝试上游。有效数据缓存七天；线上失败时继续使用已有快照。
 
-`Update CDN Data` 默认合并有效上游快照和维护镜像列表。第三方子域发现仅在手动勾选时运行，不再依赖每周启动 Chrome 抓取查询网站。来源失败保留原有成功时间；节点无变化时不重复提交。
+**本仓库已停用 GitHub Actions，并移除全部工作流。** 构建、测试、节点维护和版本发布在本地手动完成，不再定时启动任务或依赖 Pages 部署。
 
-工作流会验证代码和数据，构建同一快照的安装脚本，然后提交及上传产物。`Validate CCB` 验证构建一致性，并运行受控媒体服务器与 Chromium 适配测试。Pages 只在成功检查后部署。
+需要更新节点时运行 `go run update.go`，默认合并有效上游快照和维护镜像列表。第三方子域发现仅在手动设置 `CCB_DISCOVER=1` 时运行。来源失败保留原有成功时间；节点无变化时不重写数据。
 
-Fork 新仓库需要在 Settings → Pages 中启用 GitHub Actions 构建。当前仓库已配置。Pages 不可用时仍可通过上面的 GitHub 安装入口安装，使用内嵌节点。
+更新完成后运行 `python script/build.py` 和本地验证命令，再将源码、数据与安装脚本作为同一快照提交。手动发布 GitHub Release，附带安装脚本和 2.2.0 回退脚本。插件安装与更新入口仍使用 GitHub 原始文件及 jsDelivr，不依赖构建服务。
 
 ## 本地构建与验证
 
@@ -56,6 +56,8 @@ node --check script/ccb.bundle.user.js
 go test update.go update_test.go
 go test ./server
 npm run test:browser
+# 或使用本地完整检查入口（Go 不在 PATH 时可传 --go <路径>）
+python script/verify.py --browser
 ```
 
 Windows 浏览器测试默认使用已安装的 Edge。其他环境执行 `npx playwright install chromium`；也可通过 `CCB_BROWSER` 指定 Chromium 可执行文件。

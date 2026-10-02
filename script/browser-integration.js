@@ -111,7 +111,9 @@ const registerPlayInfo = obj => {
     }
     visit(obj)
     if (!found.length) return
-    const fingerprint = found.map(x => x.value.baseUrl || x.value.base_url).join('\n')
+    const fingerprint = found.map(x => JSON.stringify({ kind: x.kind, id: x.value.id,
+        primary: x.value.baseUrl || x.value.base_url,
+        backups: x.value.backupUrl || x.value.backup_url || x.value.backup_url_list || [] })).join('\n')
     if (fingerprint !== playFingerprint) { engine.reset(); playFingerprint = fingerprint; diagnostics.video = diagnostics.audio = null }
     found.forEach(x => engine.register(x.value, x.kind))
 }

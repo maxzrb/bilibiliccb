@@ -442,13 +442,5 @@ func runUpdate() string {
 
 func main() {
 	status := runUpdate()
-	if path := os.Getenv("GITHUB_OUTPUT"); path != "" {
-		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer f.Close()
-		fmt.Fprintf(f, "status=%s\n", status)
-	}
 	log.Printf("更新结果: %s", status)
 }

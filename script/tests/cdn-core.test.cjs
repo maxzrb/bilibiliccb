@@ -180,7 +180,7 @@ test('两个不足码率的有效窗口才扩展回退池；暂停不触发', as
     const f = await fixture(t)
     let clock = 40000, demand = true
     const e = engine(async (u, init) => { const r = await f.transport(u, init); clock += 5100; return r },
-        { now: () => clock, playback: () => ({ demand, buffer: 2 }), config: { threads: 2 } })
+        { now: () => clock, playback: () => ({ demand, buffer: 2 }), config: { acceleration: false } })
     e.resource.bandwidth = 100000000
     await e.core.route(original, { headers: { Range: 'bytes=0-1048575' } })
     assert.equal(e.resource.expanded, true)

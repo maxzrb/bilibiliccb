@@ -251,6 +251,8 @@
                 const threads = c.acceleration === false || !r.parallel || !r.originals.some(ordinary) ? 1
                     : c.threads && c.threads !== 'auto' ? Math.max(2, Math.min(8, Number(c.threads) || 4)) : r.threads
                 const output = new Uint8Array(wanted.size)
+                // 初始验活时间不计入实际下载的低速窗口。
+                if (!r.windows.length && !r.windowBytes) r.windowAt = now()
                 let cursor = wanted.start, lastUrl = available[0].u
                 const group = new AbortController()
                 const groupCancel = () => group.abort()

@@ -19,7 +19,6 @@
 // @connect      cdn.jsdelivr.net
 // @connect      raw.githubusercontent.com
 // @connect      api.bilibili.com
-// @connect      maxzrb.github.io
 // @connect      bilivideo.com
 // @connect      akamaized.net
 // @updateURL    https://raw.githubusercontent.com/maxzrb/bilibiliccb/main/script/ccb.bundle.user.js
@@ -57,7 +56,6 @@
     const API_SOURCES = [
         'https://cdn.jsdelivr.net/gh/maxzrb/bilibiliccb@main/data',
         'https://raw.githubusercontent.com/maxzrb/bilibiliccb/main/data',
-        'https://maxzrb.github.io/bilibiliccb/api',
         'https://cdn.jsdelivr.net/gh/Kanda-Akihito-Kun/ccb@main/data',
         'https://raw.githubusercontent.com/Kanda-Akihito-Kun/ccb/main/data',
         'https://kanda-akihito-kun.github.io/ccb/api',
