@@ -2,48 +2,78 @@ name: Update CDN Data
 
 on:
   schedule:
-    - cron: '0 20 * * 6'  # 每周日东八区凌晨 4 点 (UTC 的前一天 20 点) 运行
-  workflow_dispatch:  # 允许手动触发
+    - cron: '0 20 * * 6' # 每周日北京时间凌晨 4 点。
+  workflow_dispatch:
+    inputs:
+      discover:
+        description: '额外运行第三方子域发现（可选，需要 Chrome）'
+        type: boolean
+        default: false
 
 concurrency:
-  group: update-cdn-data
-  cancel-in-progress: true
+  group: ccb-main-write
+  cancel-in-progress: false
 
 jobs:
   update-cdn:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
+          ref: main
           fetch-depth: 0
-
-      - name: Set up Go
-        uses: actions/setup-go@v4
+      - uses: actions/setup-go@v7.0.0
         with:
-          go-version: '1.26'
-
-      - name: Set up Chrome
-        uses: browser-actions/setup-chrome@v1
+          go-version-file: go.mod
+      - uses: actions/setup-node@v7.0.0
         with:
-          chrome-version: stable
-
-      - name: Create Data Directory
-        run: mkdir -p data
-
+          node-version: '24'
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.14'
+      - uses: browser-actions/setup-chrome@v1
+        if: inputs.discover == true
       - name: Update CDN Data
+        id: update
+        env:
+          CCB_DISCOVER: ${{ inputs.discover && '1' || '0' }}
         run: go run update.go
-
-      - name: Commit and Push Changes
+      - name: Test and build same snapshot
         run: |
-          git config --global user.name 'GitHub Action'
-          git config --global user.email 'action@github.com'
-          git add data/
+          go test update.go update_test.go
+          node --test script/tests/*.test.cjs
+          python -m unittest discover -s script/tests -p 'test_*.py'
+          python script/build.py
+          python script/build.py --check
+          node --check script/ccb.bundle.user.js
+      - name: Report update result
+        env:
+          UPDATE_STATUS: ${{ steps.update.outputs.status }}
+        run: |
+          echo "CDN 更新结果：$UPDATE_STATUS（preserved 表示来源失败，保留旧快照；unchanged 表示检查成功且无变化）" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ccb-install-and-data
+          path: |
+            script/ccb.bundle.user.js
+            data/*.json
+      - name: Commit and push validated snapshot
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add data/*.json script/ccb.bundle.user.js
           if git diff --cached --quiet; then
-            echo "No changes in data/, skip commit."
             exit 0
           fi
-          git commit -m "Update CDN data $(date -u)"
+          git commit -m 'chore: update validated CDN snapshot and userscript'
+          # 同步后重新构建，避免混用旧源码与新数据。
           git pull --rebase origin main
-          git push
+          python script/build.py
+          node --test script/tests/*.test.cjs
+          git add script/ccb.bundle.user.js
+          if ! git diff --cached --quiet; then
+            git commit -m 'chore: rebuild userscript after synchronization'
+          fi
+          git push origin HEAD:main

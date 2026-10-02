@@ -2,75 +2,62 @@ name: Deploy to GitHub Pages
 
 on:
   workflow_run:
-    workflows: ["Update CDN Data"]
+    workflows: ["Update CDN Data", "Validate CCB"]
     types: [completed]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
   pages: write
   id-token: write
-  actions: read
 
 concurrency:
-  group: "pages"
+  group: pages
   cancel-in-progress: false
 
 jobs:
   deploy:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Pages
-        uses: actions/configure-pages@v4
-
-      - name: Create API Directory
+      - uses: actions/checkout@v7.0.1
+        with:
+          # 数据任务会提交新快照，部署必须读取更新后的分支。
+          ref: main
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.14'
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: npm ci --ignore-scripts
+      - run: npx playwright install --with-deps chromium
+      - name: Validate published snapshot
         run: |
-          mkdir -p _site/api
+          python script/build.py --check
+          node --test script/tests/*.test.cjs
+          node --check script/ccb.bundle.user.js
+          python -m unittest discover -s script/tests -p 'test_*.py'
+          go test update.go update_test.go
+          npm run test:browser
+      - name: Setup Pages
+        uses: actions/configure-pages@v6.0.0
+      - name: Build static site
+        run: |
+          mkdir -p _site/api _site/script
           cp data/*.json _site/api/
-          # 创建API文档页面
-          cat > _site/index.html << 'EOL'
-          <!DOCTYPE html>
-          <html>
-          <head>
-            <title>CCB API Documentation</title>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <style>
-              body { font-family: Arial, sans-serif; line-height: 1.6; max-width: 800px; margin: 0 auto; padding: 20px; }
-              .endpoint { background: #f5f5f5; padding: 15px; border-radius: 5px; margin: 10px 0; }
-              code { background: #e0e0e0; padding: 2px 5px; border-radius: 3px; }
-            </style>
-          </head>
-          <body>
-            <h1>CCB API Documentation</h1>
-            <div class="endpoint">
-              <h2>Get Region List</h2>
-              <p>Returns the list of available regions.</p>
-              <code>GET /api/region.json</code>
-            </div>
-            <div class="endpoint">
-              <h2>Get CDN Data</h2>
-              <p>Returns the CDN data for all regions.</p>
-              <code>GET /api/cdn.json</code>
-            </div>
-            <div class="endpoint">
-              <h2>Get Service Info</h2>
-              <p>Returns service information including last update time.</p>
-              <code>GET /api/info.json</code>
-            </div>
-          </body>
-          </html>
-          EOL
-
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
-
+          cp script/ccb.bundle.user.js script/ccb-legacy-2.2.0.user.js _site/script/
+          cp docs/pages.html _site/index.html
+      - uses: actions/upload-pages-artifact@v5.0.0
+        with:
+          path: _site
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5.0.1

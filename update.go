@@ -9,6 +9,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -39,6 +41,7 @@ type DnsDetectResponse struct {
 }
 
 var (
+	cdnHostPattern   = regexp.MustCompile(`^[a-zA-Z0-9-]+\.(?:bilivideo\.(?:com|cn)|akamaized\.net)$`)
 	regionPatternMap = []Region{
 		{Abbr: "-bj", Name: "北京"},
 		{Abbr: "-sh-", Name: "上海"},
@@ -103,7 +106,7 @@ func isUnsafeCdnNode(subDomain string) bool {
 }
 
 func addCdnNode(region string, subDomain string) bool {
-	if subDomain == "" {
+	if !validCdnHost(subDomain) {
 		return false
 	}
 	if isUnsafeCdnNode(subDomain) {
@@ -116,6 +119,58 @@ func addCdnNode(region string, subDomain string) bool {
 	}
 	cdnMap[region] = append(cdnMap[region], subDomain)
 	return true
+}
+
+// 只接收合法媒体域名，外部抓取结果不能写入任意地址。
+func validCdnHost(host string) bool {
+	return cdnHostPattern.MatchString(host) && !isUnsafeCdnNode(host)
+}
+
+func mergeCdnData(data map[string][]string) int {
+	allowed := make(map[string]bool)
+	for _, region := range regionPatternMap {
+		allowed[region.Name] = true
+	}
+	added := 0
+	for region, nodes := range data {
+		if allowed[region] {
+			added += addCdnNodes(region, nodes)
+		}
+	}
+	return added
+}
+
+func fetchUpstreamData() (map[string][]string, error) {
+	url := os.Getenv("CCB_UPSTREAM_URL")
+	if url == "" {
+		url = "https://raw.githubusercontent.com/Kanda-Akihito-Kun/ccb/main/data/cdn.json"
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("上游返回 HTTP %d", resp.StatusCode)
+	}
+	var data map[string][]string
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&data); err != nil {
+		return nil, err
+	}
+	count := 0
+	for _, nodes := range data {
+		for _, node := range nodes {
+			if !validCdnHost(node) {
+				return nil, fmt.Errorf("上游包含无效节点: %s", node)
+			}
+			count++
+		}
+	}
+	if count < 50 {
+		return nil, fmt.Errorf("上游有效节点数量过少: %d", count)
+	}
+	return data, nil
 }
 
 func addCdnNodes(region string, subDomains []string) int {
@@ -304,28 +359,47 @@ func writeJson(path string, data interface{}) {
 	}
 }
 
-func main() {
+func runUpdate() string {
+	cdnMap = make(map[string][]string)
 	if err := readExistingCdnData(); err != nil {
 		log.Printf("读取现有 data/cdn.json 失败，将仅在接口成功时生成新数据: %v", err)
+	}
+	before := make(map[string][]string)
+	for region, nodes := range cdnMap {
+		before[region] = append([]string(nil), nodes...)
 	}
 	if removed := removeUnsafeCdnNodes(); removed > 0 {
 		log.Printf("已移除 %d 个包含 origin/all 的危险节点", removed)
 	}
 
 	fetchSucceeded := false
-	subDomains, err := fetchSubDomains()
-	if err != nil {
-		log.Printf("所有子域接口均更新失败，保留现有节点: %v", err)
-	} else {
-		fetchSucceeded = true
-		added := matchSubDomainsToRegion(subDomains)
-		added += addCdnNodes("海外", kaigaiCdnList)
-		added += addCdnNodes("福建", fuzhouCdnList)
-		log.Printf("成功更新 CDN 数据，发现 %d 个子域，新增 %d 个节点", len(subDomains), added)
+	if os.Getenv("CCB_OFFLINE") != "1" {
+		if data, err := fetchUpstreamData(); err == nil {
+			fetchSucceeded = true
+			log.Printf("已取得有效上游数据，新增 %d 个节点", mergeCdnData(data))
+		} else {
+			log.Printf("上游数据不可用，保留本地快照: %v", err)
+		}
+	}
+	// 维护的镜像列表可离线使用，不依赖子域查询网站或 Chrome。
+	if body, err := os.ReadFile("data/mirrors.json"); err == nil {
+		var maintained map[string][]string
+		if json.Unmarshal(body, &maintained) == nil {
+			log.Printf("合并维护镜像列表，新增 %d 个节点", mergeCdnData(maintained))
+		}
+	}
+	// 第三方发现仅在手动明确开启时使用，失败不阻塞正常更新。
+	if os.Getenv("CCB_DISCOVER") == "1" && os.Getenv("CCB_OFFLINE") != "1" {
+		if subDomains, err := fetchSubDomains(); err == nil {
+			fetchSucceeded = true
+			log.Printf("补充发现新增 %d 个节点", matchSubDomainsToRegion(subDomains))
+		} else {
+			log.Printf("补充发现失败，保留已有节点: %v", err)
+		}
 	}
 
-	if len(cdnMap) == 0 && !fetchSucceeded {
-		log.Fatal("没有可保留的现有节点，且两个外部接口都失败")
+	if len(cdnMap) == 0 {
+		log.Fatal("没有可用节点快照")
 	}
 
 	for region := range cdnMap {
@@ -342,7 +416,18 @@ func main() {
 		seenRegions[v.Name] = true
 	}
 
-	os.MkdirAll("data", 0755)
+	changed := !reflect.DeepEqual(before, cdnMap)
+	if !changed {
+		if fetchSucceeded {
+			log.Print("有效来源检查成功，节点无变化，不重写数据或成功时间")
+			return "unchanged"
+		}
+		log.Print("未取得新的有效外部数据，保留已有快照及成功时间")
+		return "preserved"
+	}
+	if err := os.MkdirAll("data", 0755); err != nil {
+		log.Fatal(err)
+	}
 	writeJson("data/cdn.json", cdnMap)
 	writeJson("data/region.json", regionList)
 
@@ -352,4 +437,18 @@ func main() {
 		}
 		writeJson("data/info.json", info)
 	}
+	return "updated"
+}
+
+func main() {
+	status := runUpdate()
+	if path := os.Getenv("GITHUB_OUTPUT"); path != "" {
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer f.Close()
+		fmt.Fprintf(f, "status=%s\n", status)
+	}
+	log.Printf("更新结果: %s", status)
 }

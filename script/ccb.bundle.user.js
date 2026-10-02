@@ -3,7 +3,7 @@
 // @description  Custom CDN of Bilibili (CCB)
 // @namespace    CCB
 // @license      MIT
-// @version      2.2.0
+// @version      2.3.0
 // @author       鼠鼠今天吃嘉然, AreithDream
 // @run-at       document-start
 // @match        https://www.bilibili.com/video/*
@@ -19,6 +19,11 @@
 // @connect      cdn.jsdelivr.net
 // @connect      raw.githubusercontent.com
 // @connect      api.bilibili.com
+// @connect      maxzrb.github.io
+// @connect      bilivideo.com
+// @connect      akamaized.net
+// @updateURL    https://raw.githubusercontent.com/maxzrb/bilibiliccb/main/script/ccb.bundle.user.js
+// @downloadURL  https://raw.githubusercontent.com/maxzrb/bilibiliccb/main/script/ccb.bundle.user.js
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -342,7 +347,8 @@ const EMBEDDED = {
         "cn-jssz-cm-02-34.bilivideo.com",
         "cn-jssz-cm-02-35.bilivideo.com",
         "cn-jssz-cm-02-40.bilivideo.com",
-        "cn-jssz-cm-02-42.bilivideo.com"
+        "cn-jssz-cm-02-42.bilivideo.com",
+        "ec-jssz-ct-01-02.bilivideo.com"
     ],
     "江西": [
         "cn-jxjj-ct-01-01.bilivideo.com",
@@ -453,6 +459,7 @@ const EMBEDDED = {
         "upos-sz-mirroralibstar1.bilivideo.com",
         "upos-sz-mirroraliov.bilivideo.com",
         "upos-sz-mirrorasiaov.bilivideo.com",
+        "upos-sz-mirrorawsov.bilivideo.com",
         "upos-sz-mirrorbd.bilivideo.com",
         "upos-sz-mirrorbdb.bilivideo.com",
         "upos-sz-mirrorcf1ov.bilivideo.com",
@@ -615,11 +622,458 @@ const EMBEDDED = {
         "cn-hljheb-ct-01-07.bilivideo.com"
     ]
 },
-    buildTime: "2026-07-20T17:03:19Z"
+    buildTime: "2026-09-26T22:32:49Z"
 };
 // ===EMBEDDED_END===
+    // ===CORE_START===
+/* CCB 媒体选源与 Range 调度内核。可在浏览器和 Node 测试中独立使用。 */
+;(function (root, factory) {
+    const api = factory()
+    if (typeof module === 'object' && module.exports) module.exports = api
+    else root.CcbCore = api
+})(typeof globalThis === 'object' ? globalThis : this, function () {
+    'use strict'
+    const MIRRORS = ['upos-sz-mirrorali.bilivideo.com', 'upos-sz-mirrorcos.bilivideo.com',
+        'upos-sz-mirrorhw.bilivideo.com', 'upos-sz-mirror08c.bilivideo.com']
+    const BUDGET = 16 * 1024 * 1024
+    const CHUNK = 512 * 1024
+    const abortError = () => new DOMException('请求已取消', 'AbortError')
+    const ordinary = value => {
+        try {
+            const u = new URL(value)
+            return u.protocol === 'https:' && /^upos-(?!tf-)[\w-]+\.bilivideo\.com$/.test(u.hostname)
+                && !/-302(?:\.|-)/.test(u.hostname) && u.pathname.startsWith('/upgcxcode/')
+                && u.searchParams.get('os') !== 'mcdn'
+        } catch (_) { return false }
+    }
+    const host = value => { try { return new URL(value).hostname } catch (_) { return '' } }
+    const swap = (value, node) => {
+        if (!ordinary(value)) return null
+        try {
+            const u = new URL(value), n = new URL(node.includes('://') ? node : `https://${node}`)
+            if (n.protocol !== 'https:' || !/^(?:upos-[\w-]+|cn-[\w-]+)\.bilivideo\.com$/.test(n.hostname)) return null
+            u.hostname = n.hostname; u.port = ''
+            return u.href
+        } catch (_) { return null }
+    }
+    const range = value => {
+        const m = /^bytes=(\d+)-(\d+)$/.exec(value || '')
+        if (!m) return null
+        const start = Number(m[1]), end = Number(m[2])
+        return Number.isSafeInteger(end) && end >= start ? { start, end, size: end - start + 1 } : null
+    }
+    const contentRange = value => {
+        const m = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(value || '')
+        if (!m) return null
+        const [start, end, total] = m.slice(1).map(Number)
+        return [start, end, total].every(Number.isSafeInteger) && start <= end && end < total ? { start, end, total } : null
+    }
+    const sameBytes = (a, b) => a.length === b.length && a.every((v, i) => v === b[i])
+    const expiry = value => {
+        try {
+            const p = new URL(value).searchParams
+            const e = p.get('deadline') || p.get('expires')
+            return e && /^\d+$/.test(e) ? Number(e) * 1000 : Infinity
+        } catch (_) { return 0 }
+    }
+    const makeResponse = (bytes, headers, url, status = 206) => {
+        const h = new Headers(headers)
+        h.delete('content-encoding'); h.delete('transfer-encoding'); h.set('content-length', String(bytes.byteLength))
+        const r = new Response(bytes, { status, headers: h })
+        Object.defineProperty(r, 'url', { value: url })
+        return r
+    }
+
+    function create(options = {}) {
+        const transport = options.transport || ((url, init) => fetch(url, init))
+        const config = options.config || (() => ({}))
+        const now = options.now || Date.now
+        const resources = new Set(), urls = new Map(), active = new Set()
+        let lastVideo = null
+        let reserved = 0
+        const waiters = new Set()
+        const notify = event => options.onStatus?.({ time: now(), ...event })
+        const wake = () => { for (const f of [...waiters]) f() }
+        async function reserve(size, signal) {
+            if (signal.aborted) throw abortError()
+            if (reserved + size > BUDGET) await new Promise((resolve, reject) => {
+                const cancel = () => { waiters.delete(check); reject(abortError()) }
+                const check = () => {
+                    if (reserved + size <= BUDGET) { waiters.delete(check); signal.removeEventListener('abort', cancel); reserved += size; resolve() }
+                }
+                waiters.add(check); signal.addEventListener('abort', cancel, { once: true })
+            })
+            else reserved += size
+        }
+        function register(rep, kind = 'video') {
+            const primary = rep.baseUrl || rep.base_url
+            const backup = rep.backupUrl || rep.backup_url || rep.backup_url_list || []
+            if (typeof primary !== 'string') return null
+            const originals = [...new Set([primary, ...(Array.isArray(backup) ? backup : [])].filter(v => {
+                try { const u = new URL(v); return u.protocol === 'https:' && /(?:^|\.)(?:bilivideo\.(?:com|cn|net)|akamaized\.net)$/.test(u.hostname) } catch (_) { return false }
+            }))]
+            if (!originals.length) return null
+            const key = `${kind}:${rep.id || ''}:${primary}`
+            let r = [...resources].find(x => x.key === key)
+            if (!r) {
+                r = { key, kind, id: rep.id, primary, originals, bandwidth: Number(rep.bandwidth) || 0,
+                    probes: new Map(), health: new Map(), parallel: true, expanded: false,
+                    switchedAt: 0, windows: [], windowAt: now(), windowBytes: 0, threads: 4 }
+                resources.add(r)
+            }
+            for (const u of originals) urls.set(u, r)
+            for (const u of candidates(r)) urls.set(u, r)
+            return r
+        }
+        function candidates(r) {
+            const c = config(), preferred = c.preferred
+            if (c.enabled === false) return r.originals
+            if (r.kind === 'audio' && c.audioOriginal) return [...r.originals.slice(1), r.primary]
+            const nodes = [preferred, ...MIRRORS, ...(c.shenzhen || []).slice(0, 2)].filter(v => typeof v === 'string' && v)
+            const chosen = swap(r.originals.find(ordinary) || '', preferred || '')
+            const local = [...new Set([chosen, ...nodes.filter(n => host(`https://${n}`)?.includes('-sz-')).map(n => swap(r.originals.find(ordinary) || '', n))].filter(Boolean))]
+            const others = [...r.originals.slice(1), ...MIRRORS.map(n => swap(r.originals.find(ordinary) || '', n)), r.primary]
+            const banned = new Set(c.blacklist || [])
+            return [...new Set([...local, ...others].filter(Boolean))].filter(u => !banned.has(host(u)))
+        }
+        const isLocal = (r, u) => u === swap(r.originals.find(ordinary) || '', config().preferred || '') || host(u).includes('-sz-')
+        function failure(r, u, error) {
+            if (error?.name === 'AbortError') return
+            const h = r.health.get(u) || { failures: 0, blockedUntil: 0 }
+            h.failures++
+            if (h.failures >= 2) h.blockedUntil = now() + 60000
+            r.health.set(u, h)
+            notify({ kind: r.kind, node: host(u), reason: error.message || '请求失败', state: '冷却', blockedUntil: h.blockedUntil })
+        }
+        function sample(r, u, bytes, ms, finalUrl) {
+            const bps = bytes * 1000 / Math.max(ms, 1)
+            const h = r.health.get(u) || { failures: 0, blockedUntil: 0 }
+            h.bps = h.bps ? h.bps * .7 + bps * .3 : bps; h.failures = 0; h.blockedUntil = 0
+            r.health.set(u, h)
+            notify({ kind: r.kind, node: host(finalUrl || u), requestedNode: host(u), bps,
+                state: '播放下载', reason: finalUrl && host(finalUrl) !== host(u) ? '服务端重定向' : r.expanded ? '首选池不可用或持续过慢，已回退' : '首选池' })
+            const playback = options.playback?.() || {}
+            if (!playback.demand) { r.windows = []; r.windowBytes = 0; r.windowAt = now(); return }
+            r.windowBytes += bytes
+            const elapsed = now() - r.windowAt
+            if (elapsed >= 5000) {
+                r.windows.push(r.windowBytes * 8000 / elapsed); r.windows = r.windows.slice(-2)
+                r.windowBytes = 0; r.windowAt = now()
+                if (playback.demand && playback.buffer < 10 && r.bandwidth > 0 && r.windows.length === 2
+                    && r.windows.every(v => v < r.bandwidth * 1.3) && now() - r.switchedAt >= 30000) {
+                    r.expanded = true; r.switchedAt = now()
+                }
+                if (config().threads === 'auto' || !config().threads) {
+                    r.threads = Math.max(2, Math.min(8, r.threads + (playback.demand && playback.buffer < 10 ? 1 : -1)))
+                }
+            }
+        }
+        async function readRange(u, start, end, signal, timeout = 8000) {
+            if (signal?.aborted) throw abortError()
+            const ctrl = new AbortController()
+            const cancel = () => ctrl.abort()
+            signal?.addEventListener('abort', cancel, { once: true })
+            const timer = setTimeout(cancel, timeout)
+            try {
+                const response = await transport(u, { method: 'GET', headers: { Range: `bytes=${start}-${end}` },
+                    signal: ctrl.signal, timeout, maxBytes: end - start + 1 })
+                if (!response.status || response.type === 'opaque') throw new TypeError('响应不可读取，内容未知')
+                if (response.status !== 206) throw Object.assign(new Error(`HTTP ${response.status}，未返回有效分片`), { status: response.status })
+                const cr = contentRange(response.headers.get('content-range'))
+                if (!cr || cr.start !== start || cr.end !== Math.min(end, cr.total - 1)) throw new Error('Content-Range 不匹配')
+                const bytes = new Uint8Array(await response.arrayBuffer())
+                if (bytes.length !== cr.end - cr.start + 1) throw new Error('分片长度不匹配')
+                return { bytes, cr, headers: response.headers, url: response.url || u }
+            } catch (e) {
+                if (ctrl.signal.aborted && !signal?.aborted) throw new Error('请求超时')
+                throw e
+            } finally { clearTimeout(timer); signal?.removeEventListener('abort', cancel) }
+        }
+        async function probe(r, u, signal, size = 65536) {
+            const old = r.probes.get(u)
+            if (old && old.until > now() && size === 65536) return old
+            if (expiry(u) <= now() + 1000) return { state: 'expired', hasContent: false, url: u }
+            const started = now()
+            try {
+                const data = await readRange(u, 0, size - 1, signal, 3000)
+                const result = { ...data, state: 'valid', hasContent: true, bps: data.bytes.length * 1000 / Math.max(now() - started, 1),
+                    until: Math.min(now() + 90000, expiry(u)), source: u }
+                if (size === 65536) r.probes.set(u, result)
+                notify({ kind: r.kind, node: host(data.url), state: '已验证', bps: result.bps })
+                return result
+            } catch (e) {
+                if (signal?.aborted) throw e
+                const result = { state: e instanceof TypeError ? 'unknown' : 'invalid', hasContent: e instanceof TypeError ? null : false, error: e, until: now() + 15000 }
+                if (size === 65536) r.probes.set(u, result)
+                failure(r, u, e)
+                return result
+            }
+        }
+        function compatible(a, b) {
+            if (a.cr.total !== b.cr.total || !sameBytes(a.bytes, b.bytes)) return false
+            const ae = a.headers.get('etag'), be = b.headers.get('etag')
+            const strong = ae && be && !ae.startsWith('W/') && ae === be
+            const au = new URL(a.source), bu = new URL(b.source)
+            return !!strong || au.pathname + au.search === bu.pathname + bu.search
+        }
+        async function eligible(r, signal) {
+            let pool = candidates(r).filter(u => (r.health.get(u)?.blockedUntil || 0) <= now())
+            const local = pool.filter(u => isLocal(r, u))
+            if (!r.expanded && local.length) pool = local
+            else if (r.expanded) pool = [...local.slice(0, 3), ...pool.filter(u => !isLocal(r, u)).slice(0, 3)]
+            pool = pool.slice(0, 6)
+            let out = []
+            // 分批验活，首批最多六个；无可用节点再检查余下节点。
+            for (let i = 0; i < pool.length && !out.length; i += 6) {
+                const batch = pool.slice(i, i + 6)
+                for (let j = 0; j < batch.length; j += 3) {
+                    const results = await Promise.all(batch.slice(j, j + 3).map(async u => ({ u, p: await probe(r, u, signal) })))
+                    out.push(...results.filter(x => x.p.state === 'valid'))
+                }
+            }
+            if (!out.length && !r.expanded) { r.expanded = true; r.switchedAt = now(); return eligible(r, signal) }
+            const preferred = swap(r.originals.find(ordinary) || '', config().preferred || '')
+            const speed = x => r.health.get(x.u)?.bps || x.p.bps
+            out.sort((a, b) => (!r.expanded && a.u === preferred ? -1 : !r.expanded && b.u === preferred ? 1 : speed(b) - speed(a)))
+            if (out.length) out = out.filter(x => compatible(out[0].p, x.p))
+            return out
+        }
+        async function route(input, init = {}) {
+            const u = typeof input === 'string' ? input : input.url
+            const r = urls.get(u), c = config()
+            if (!r || c.enabled === false) return null
+            if (r.kind === 'video') lastVideo = r
+            const headers = new Headers(init.headers || (typeof input !== 'string' ? input.headers : undefined))
+            const wanted = range(headers.get('range'))
+            if ((init.method || input.method || 'GET').toUpperCase() !== 'GET' || !wanted || wanted.size > BUDGET) {
+                notify({ kind: r.kind, state: '原生下载', reason: '非有限 Range 请求或超过 16 MiB' }); return null
+            }
+            if (!r.originals.some(ordinary)) {
+                notify({ kind: r.kind, state: '原生下载', node: host(u), reason: '特殊路径或 M CDN，保留原始地址' }); return null
+            }
+            const ctrl = new AbortController(), signal = init.signal || input.signal
+            const cancel = () => ctrl.abort()
+            if (signal?.aborted) throw abortError()
+            signal?.addEventListener('abort', cancel, { once: true }); active.add(ctrl)
+            let allocated = false
+            try {
+                await reserve(wanted.size, ctrl.signal); allocated = true
+                const available = await eligible(r, ctrl.signal)
+                if (!available.length) {
+                    const signatureFailure = r.originals.every(x => expiry(x) <= now() + 1000)
+                        || r.originals.some(x => r.probes.get(x)?.error?.status === 403)
+                    if (signatureFailure && !r.refreshTried && options.refresh) {
+                        r.refreshTried = true
+                        // 刷新地址会清空旧资源；先释放旧请求占用，避免递归等待预算。
+                        reserved -= wanted.size; allocated = false; wake(); active.delete(ctrl)
+                        try {
+                            const fresh = await options.refresh(r)
+                            if (fresh) { fresh.refreshTried = true; return await route(fresh.primary, init) }
+                        } catch (e) { if (signal?.aborted) throw e }
+                    }
+                    notify({ kind: r.kind, state: '原生下载', reason: '没有已验证的兼容节点' })
+                    return null
+                }
+                const total = available[0].p.cr.total
+                if (wanted.end >= total) return null
+                const threads = c.acceleration === false || !r.parallel || !r.originals.some(ordinary) ? 1
+                    : c.threads && c.threads !== 'auto' ? Math.max(2, Math.min(8, Number(c.threads) || 4)) : r.threads
+                const output = new Uint8Array(wanted.size)
+                let cursor = wanted.start, lastUrl = available[0].u
+                const group = new AbortController()
+                const groupCancel = () => group.abort()
+                ctrl.signal.addEventListener('abort', groupCancel, { once: true })
+                const task = async index => {
+                    while (cursor <= wanted.end) {
+                        const start = cursor, end = Math.min(start + CHUNK - 1, wanted.end); cursor = end + 1
+                        let good = false, error
+                        for (let attempt = 0; attempt < 3; attempt++) {
+                            if (group.signal.aborted) throw abortError()
+                            const target = available[(index + attempt) % available.length]
+                            try {
+                                const started = now(), part = await readRange(target.u, start, end, group.signal)
+                                const etag = part.headers.get('etag'), initial = target.p.headers.get('etag')
+                                if (part.cr.total !== total || (etag && initial && etag !== initial)) throw new Error('资源在下载期间发生变化')
+                                output.set(part.bytes, start - wanted.start); lastUrl = part.url
+                                sample(r, target.u, part.bytes.length, now() - started, part.url); good = true; break
+                            } catch (e) { error = e; if (group.signal.aborted) throw e; failure(r, target.u, e) }
+                        }
+                        if (!good) throw error
+                    }
+                }
+                const tasks = Array.from({ length: Math.min(threads, Math.ceil(wanted.size / CHUNK)) }, (_, i) => task(i))
+                try { await Promise.all(tasks) }
+                catch (e) {
+                    group.abort(); await Promise.allSettled(tasks)
+                    if (ctrl.signal.aborted) throw abortError()
+                    r.parallel = false; notify({ kind: r.kind, state: '单连接降级', reason: e.message })
+                    try {
+                        const part = await readRange(r.primary, wanted.start, wanted.end, ctrl.signal)
+                        return makeResponse(part.bytes, part.headers, part.url)
+                    } catch (fallbackError) {
+                        if (fallbackError.status === 403 && !r.refreshTried && options.refresh) {
+                            r.refreshTried = true; reserved -= wanted.size; allocated = false; wake(); active.delete(ctrl)
+                            const fresh = await options.refresh(r)
+                            if (fresh) { fresh.refreshTried = true; return await route(fresh.primary, init) }
+                        }
+                        throw fallbackError
+                    }
+                } finally { ctrl.signal.removeEventListener('abort', groupCancel) }
+                const outHeaders = new Headers(available[0].p.headers)
+                outHeaders.set('content-range', `bytes ${wanted.start}-${wanted.end}/${total}`)
+                return makeResponse(output, outHeaders, lastUrl)
+            } finally {
+                if (allocated) { reserved -= wanted.size; wake() }
+                active.delete(ctrl); signal?.removeEventListener('abort', cancel)
+            }
+        }
+        const cancel = () => { for (const c of active) c.abort() }
+        const reset = () => { cancel(); resources.clear(); urls.clear(); lastVideo = null }
+        return { register, route, probe, candidates, resources, reset, cancel,
+            resourceFor: url => urls.get(url),
+            first: () => lastVideo || [...resources].find(r => r.kind === 'video'),
+            inspect: () => ({ resources: resources.size, reserved, active: active.size }) }
+    }
+
+    // XHR 只接管异步 GET arraybuffer 分片，其余请求保留浏览器原生行为。
+    function xhrAdapter(Native, route) {
+        return class extends Native {
+            open(method, url, async = true, ...rest) {
+                this._ccb = null; this._ccbReq = { method, url: String(url), async, headers: {} }
+                return super.open(method, url, async, ...rest)
+            }
+            setRequestHeader(k, v) { if (this._ccbReq) this._ccbReq.headers[k] = v; return super.setRequestHeader(k, v) }
+            get readyState() { return this._ccb ? this._ccb.readyState : super.readyState }
+            get status() { return this._ccb ? this._ccb.status : super.status }
+            get statusText() { return this._ccb ? this._ccb.statusText : super.statusText }
+            get responseURL() { return this._ccb ? this._ccb.url : super.responseURL }
+            get response() { return this._ccb ? this._ccb.body : super.response }
+            get responseText() { if (this._ccb) throw new DOMException('响应类型为 arraybuffer', 'InvalidStateError'); return super.responseText }
+            getAllResponseHeaders() { return this._ccb ? [...this._ccb.headers].map(([k, v]) => `${k}: ${v}\r\n`).join('') : super.getAllResponseHeaders() }
+            getResponseHeader(k) { return this._ccb ? this._ccb.headers.get(k) : super.getResponseHeader(k) }
+            send(body) {
+                const req = this._ccbReq
+                if (!req || !req.async || req.method.toUpperCase() !== 'GET' || this.responseType !== 'arraybuffer'
+                    || this.withCredentials || body != null || !range(new Headers(req.headers).get('range'))) return super.send(body)
+                if (this._ccbCtrl) throw new DOMException('请求已经发送', 'InvalidStateError')
+                const ctrl = new AbortController(); this._ccbCtrl = ctrl
+                let timedOut = false
+                const timer = this.timeout ? setTimeout(() => { timedOut = true; ctrl.abort() }, this.timeout) : null
+                const emit = type => this.dispatchEvent(new Event(type))
+                Promise.resolve().then(() => route(req.url, { method: req.method, headers: req.headers, signal: ctrl.signal }))
+                    .then(async response => {
+                        if (ctrl.signal.aborted) throw abortError()
+                        if (!response) { clearTimeout(timer); this._ccbCtrl = null; return super.send(body) }
+                        this._ccb = { readyState: 2, status: response.status, statusText: response.statusText, url: response.url, headers: response.headers, body: null }
+                        emit('loadstart'); emit('readystatechange')
+                        this._ccb.readyState = 3; emit('readystatechange')
+                        this._ccb.body = await response.arrayBuffer()
+                        if (ctrl.signal.aborted) throw abortError()
+                        this._ccb.readyState = 4; emit('readystatechange')
+                        this.dispatchEvent(new ProgressEvent('progress', { lengthComputable: true, loaded: this._ccb.body.byteLength, total: this._ccb.body.byteLength }))
+                        emit('load'); emit('loadend')
+                    }).catch(e => {
+                        this._ccb = { readyState: ctrl.signal.aborted && !timedOut ? 0 : 4, status: 0, statusText: '', url: '', headers: new Headers(), body: null }
+                        emit('readystatechange'); emit(timedOut ? 'timeout' : e.name === 'AbortError' ? 'abort' : 'error'); emit('loadend')
+                    }).finally(() => { clearTimeout(timer); if (this._ccbCtrl === ctrl) this._ccbCtrl = null })
+            }
+            abort() { if (this._ccbCtrl) this._ccbCtrl.abort(); else super.abort() }
+        }
+    }
+    return { create, xhrAdapter, ordinary, swap, range, contentRange, MIRRORS, BUDGET, CHUNK }
+})
+
+/* Worker 使用专用消息通道调用页面内核，避免两套选源状态发生分歧。 */
+function ccbWorkerRuntime(channel) {
+    if (self.__CCB_RANGE_WORKER__) return
+    self.__CCB_RANGE_WORKER__ = true
+    const pending = new Map()
+    let serial = 0
+    self.addEventListener('message', event => {
+        const m = event.data
+        if (!m || m.channel !== channel || m.type !== 'result') return
+        event.stopImmediatePropagation()
+        const p = pending.get(m.id)
+        if (!p) return
+        pending.delete(m.id); p.cleanup()
+        if (m.error) p.reject(Object.assign(new Error(m.error), { name: m.name || 'Error' }))
+        else if (m.skip) p.resolve(null)
+        else {
+            const response = new Response(m.body, { status: m.status, headers: m.headers })
+            Object.defineProperty(response, 'url', { value: m.url })
+            p.resolve(response)
+        }
+    })
+    const route = (url, init = {}) => {
+        if (!self.CcbCore.range(new Headers(init.headers).get('range')) || !String(url).includes('/upgcxcode/')) return Promise.resolve(null)
+        return new Promise((resolve, reject) => {
+            const id = ++serial, signal = init.signal
+            const abort = () => {
+                self.postMessage({ channel, type: 'cancel', id }); pending.delete(id); cleanup()
+                reject(new DOMException('请求已取消', 'AbortError'))
+            }
+            const timer = setTimeout(() => {
+                self.postMessage({ channel, type: 'cancel', id }); pending.delete(id); cleanup()
+                reject(new Error('Worker 分片请求超时'))
+            }, 60000)
+            const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort) }
+            if (signal?.aborted) { abort(); return }
+            pending.set(id, { resolve, reject, cleanup })
+            signal?.addEventListener('abort', abort, { once: true })
+            self.postMessage({ channel, type: 'request', id, url: String(url), headers: [...new Headers(init.headers)], method: init.method || 'GET' })
+        })
+    }
+    const nativeFetch = self.fetch.bind(self)
+    self.fetch = async (input, init = {}) => {
+        const request = new Request(input, init)
+        const response = await route(request.url, { method: request.method, headers: request.headers, signal: request.signal })
+        if (response) return response
+        const native = await nativeFetch(request)
+        self.postMessage({ channel, type: 'native', requested: request.url, actual: native.url })
+        return native
+    }
+    if (self.XMLHttpRequest) self.XMLHttpRequest = self.CcbCore.xhrAdapter(self.XMLHttpRequest, route)
+}
+
+function ccbAttachWorker(worker, channel, engine, noteNative) {
+    const jobs = new Map()
+    worker.addEventListener('message', event => {
+        const m = event.data
+        if (!m || m.channel !== channel) return
+        event.stopImmediatePropagation()
+        if (m.type === 'native') { noteNative?.(m.requested, m.actual); return }
+        if (m.type === 'cancel') { jobs.get(m.id)?.abort(); return }
+        if (m.type !== 'request' || !Number.isSafeInteger(m.id) || jobs.has(m.id)) return
+        const ctrl = new AbortController(); jobs.set(m.id, ctrl)
+        engine.route(m.url, { headers: m.headers, method: m.method, signal: ctrl.signal }).then(async response => {
+            if (!response) worker.postMessage({ channel, type: 'result', id: m.id, skip: true })
+            else {
+                const body = await response.arrayBuffer()
+                worker.postMessage({ channel, type: 'result', id: m.id, body, headers: [...response.headers], status: response.status, url: response.url }, [body])
+            }
+        }).catch(e => worker.postMessage({ channel, type: 'result', id: m.id, error: e.message, name: e.name }))
+            .finally(() => jobs.delete(m.id))
+    })
+    const terminate = worker.terminate.bind(worker)
+    worker.terminate = () => { for (const c of jobs.values()) c.abort(); jobs.clear(); terminate() }
+    return worker
+}
+
+// ===CORE_END===
+    const Core = globalThis.CcbCore
+    let regionList = ['手动输入']
+    let cdnDataCache = EMBEDDED.cdn
+    const nativeFetch = unsafeWindow.fetch.bind(unsafeWindow)
+    const diagnostics = { events: [], video: null, audio: null }
+    let lastPlayRequest = null
+    let playFingerprint = ''
+    const liveRoutes = new Map()
+
     // API 源列表，按优先级排列 — jsDelivr 国内可访问，GitHub Pages 作为备用
     const API_SOURCES = [
+        'https://cdn.jsdelivr.net/gh/maxzrb/bilibiliccb@main/data',
+        'https://raw.githubusercontent.com/maxzrb/bilibiliccb/main/data',
+        'https://maxzrb.github.io/bilibiliccb/api',
         'https://cdn.jsdelivr.net/gh/Kanda-Akihito-Kun/ccb@main/data',
         'https://raw.githubusercontent.com/Kanda-Akihito-Kun/ccb/main/data',
         'https://kanda-akihito-kun.github.io/ccb/api',
@@ -709,14 +1163,19 @@ const EMBEDDED = {
         ctx === 'live' ? liveRegionStored : (ctx === 'diagnostics' ? diagnosticsRegionStored : mainRegionStored),
         normalizeRegion(GM_getValue(oldRegionStored, manualRegionName)),
     ))
-    const setTargetCdnNode = (ctx, value) => GM_setValue(
-        ctx === 'live' ? liveCdnNodeStored : (ctx === 'diagnostics' ? diagnosticsCdnNodeStored : mainCdnNodeStored),
-        value,
-    )
-    const setRegion = (ctx, value) => GM_setValue(
-        ctx === 'live' ? liveRegionStored : (ctx === 'diagnostics' ? diagnosticsRegionStored : mainRegionStored),
-        value,
-    )
+    const setTargetCdnNode = (ctx, value) => {
+        GM_setValue(ctx === 'live' ? liveCdnNodeStored : (ctx === 'diagnostics' ? diagnosticsCdnNodeStored : mainCdnNodeStored), value)
+        settings.contexts = settings.contexts || {}
+        settings.contexts[ctx] = { node: value, region: getRegion(ctx) }
+        GM_setValue(SETTINGS_KEY, settings)
+        invalidateConfig(); engine.cancel()
+    }
+    const setRegion = (ctx, value) => {
+        GM_setValue(ctx === 'live' ? liveRegionStored : (ctx === 'diagnostics' ? diagnosticsRegionStored : mainRegionStored), value)
+        settings.contexts = settings.contexts || {}
+        settings.contexts[ctx] = { node: getTargetCdnNode(ctx), region: value }
+        GM_setValue(SETTINGS_KEY, settings)
+    }
     const getPowerMode = () => GM_getValue(powerModeStored, true)
     const getLiveMode = () => GM_getValue(liveModeStored, false)
     const isCcbEnabled = () => getTargetCdnNode() !== defaultCdnNode
@@ -785,24 +1244,8 @@ const EMBEDDED = {
 
     const IGNORE_HOST_RE = /^(?:bvc|data|pbp|api|api\w+)\./
 
-    const replaceMediaUrl = (s) => {
-        if (typeof s !== 'string') return s
-        if (!shouldApplyReplacement()) return s
-        if (!hasMediaDomain(s)) return s
-
-        try {
-            const u = new URL(s.startsWith('//') ? `https:${s}` : s)
-            if (IGNORE_HOST_RE.test(u.hostname)) return s
-        } catch (_) {
-            const m = s.match(/^https?:\/\/([\w.-]+)/) || s.match(/^\/\/([\w.-]+)/)
-            if (m && IGNORE_HOST_RE.test(m[1])) return s
-        }
-
-        if (s.startsWith('http://') || s.startsWith('https://')) return s.replace(/^https?:\/\/.*?\//, getReplacement())
-        if (s.startsWith('//')) return s.replace(/^\/\/.*?\//, getReplacement().replace(/^https?:/, ''))
-        if (/^[^/]+\//.test(s)) return s.replace(/^[^/]+\//, `${getReplacementHost()}/`)
-        return s
-    }
+    // 点播请求由内核处理，保留原始备用节点及签名。
+    const replaceMediaUrl = s => s
 
     const replaceMediaHostValue = (s) => {
         if (typeof s !== 'string') return s
@@ -823,166 +1266,137 @@ const EMBEDDED = {
         return s
     }
 
-    // 保存最近的真实视频分片路径，用于 CDN 内容验活
-    let videoProbePath = null  // { path: '/upgcxcode/...', host: 'cn-xxx.bilivideo.com' }
-
-    // 主动从页面全局变量中采集视频探针路径
-    const scanObjForMediaUrl = (obj, depth) => {
-        if (!obj || typeof obj !== 'object' || depth > 8 || videoProbePath) return
-        if (Array.isArray(obj)) {
-            for (const item of obj) scanObjForMediaUrl(item, depth + 1)
-            return
-        }
-        for (const k in obj) {
-            if (!Object.prototype.hasOwnProperty.call(obj, k)) continue
-            const v = obj[k]
-            if (typeof v === 'string' && hasMediaDomain(v)) {
-                const probe = extractVideoPath(v)
-                if (probe) { videoProbePath = probe; return }
-            } else if (typeof v === 'object') {
-                scanObjForMediaUrl(v, depth + 1)
-            }
-        }
+    // ===INTEGRATION_START===
+// 此文件在构建时嵌入主脚本，沿用主脚本已有的 GM 配置。
+const SETTINGS_KEY = 'CCB_settings_v1'
+let settings = GM_getValue(SETTINGS_KEY, null)
+if (!settings || settings.version !== 1) {
+    settings = { version: 1, acceleration: true, threads: 'auto', audioOriginal: false,
+        contexts: Object.fromEntries(['main', 'live', 'diagnostics'].map(ctx => [ctx, { node: getTargetCdnNode(ctx), region: getRegion(ctx) }])) }
+    GM_setValue(SETTINGS_KEY, settings)
+    GM_setValue('CCB_legacyBlacklist', GM_getValue('CCB_failCount', '{}'))
+}
+let configCache = null
+const invalidateConfig = () => { configCache = null }
+const getFailCount = () => { try { return JSON.parse(GM_getValue('CCB_manualBlacklist', '{}')) } catch (_) { return {} } }
+const addFailCount = node => {
+    const list = getFailCount(); list[node] = 1
+    GM_setValue('CCB_manualBlacklist', JSON.stringify(list)); invalidateConfig()
+}
+const getNodeFailCount = node => getFailCount()[node] || 0
+const noteNative = (requested, actual) => {
+    const r = engine.resourceFor(requested)
+    if (!r) return
+    let node, requestedNode
+    try { node = new URL(actual || requested).hostname; requestedNode = new URL(requested).hostname } catch (_) { return }
+    const event = { time: Date.now(), kind: r.kind, node,
+        state: '原生下载', reason: node !== requestedNode ? '服务端重定向（原生通道）' : '原生通道，速度未知' }
+    diagnostics[r.kind] = event; diagnostics.events.push(event)
+    if (diagnostics.events.length > 50) diagnostics.events.shift()
+    document.dispatchEvent(new Event('ccb-status'))
+}
+const mediaConfig = () => {
+    if (!configCache) {
+        const preferred = getTargetCdnNode()
+        configCache = { ...settings, enabled: !isLiveContext() && preferred !== defaultCdnNode,
+            preferred: preferred === defaultCdnNode ? '' : preferred,
+            shenzhen: (cdnDataCache && cdnDataCache['深圳']) || Core.MIRRORS,
+            blacklist: Object.keys(getFailCount()) }
     }
-
-    const collectProbePath = async () => {
-        if (videoProbePath && videoProbePath.path) {
-            logger('验活: 已有探针路径', videoProbePath.path.substring(0, 60))
-            return
-        }
-
-        // 1. 扫页面全局变量
-        try { scanObjForMediaUrl(unsafeWindow.__playinfo__, 0) } catch (_) {}
-        if (videoProbePath) { logger('验活: 从 __playinfo__ 采到探针'); return }
-        try { scanObjForMediaUrl(unsafeWindow.__INITIAL_STATE__, 0) } catch (_) {}
-        if (videoProbePath) { logger('验活: 从 __INITIAL_STATE__ 采到探针'); return }
-
-        // 2. 检查是否在视频页
-        const pathname = location.pathname
-        const bvMatch = pathname.match(/\/video\/(BV[\w]+)/)
-        const epMatch = pathname.match(/\/bangumi\/play\/(ep\d+)/)
-        if (!bvMatch && !epMatch) {
-            logger('验活: 非视频页，跳过探针采集')
-            return
-        }
-
-        // 3. 提取 cid（尝试多种路径）
-        let cid = null
-        try {
-            const st = unsafeWindow.__INITIAL_STATE__
-            if (st) {
-                cid = st?.videoData?.cid || st?.cid || st?.epInfo?.cid || st?.mediaInfo?.param?.cid
-                // 也尝试从 videoData.pages 中找
-                if (!cid && st?.videoData?.pages) {
-                    const pages = st.videoData.pages
-                    if (Array.isArray(pages) && pages.length > 0) cid = pages[0].cid
-                }
-            }
-        } catch (_) {}
-        if (!cid) {
-            logger('验活: 未能提取 cid')
-            return
-        }
-        logger('验活: 提取到 cid=' + cid + '，请求 playurl API...')
-
-        // 4. 请求 playurl API（用 fetch，B站 API 支持 CORS）
-        const apiUrl = `https://api.bilibili.com/x/player/playurl?cid=${cid}&qn=0&fnval=4048&fourk=1`
-        try {
-            const resp = await fetch(apiUrl, { credentials: 'include' })
-            if (!resp.ok) { logger('验活: API 返回 ' + resp.status); return }
-            const data = await resp.json()
-            if (data.code !== 0) { logger('验活: API code=' + data.code); return }
-            scanObjForMediaUrl(data, 0)
-            if (videoProbePath) {
-                logger('验活: 从 API 采到探针', videoProbePath.path.substring(0, 60))
-            } else {
-                logger('验活: API 响应中未找到媒体 URL')
-            }
-        } catch (e) {
-            logger('验活: API 请求失败', e.message || e)
-        }
+    return configCache
+}
+const persistSettings = () => { GM_setValue(SETTINGS_KEY, settings); invalidateConfig(); engine.cancel() }
+const mediaTransport = (url, init) => new Promise((resolve, reject) => {
+    let finished = false, request
+    const finish = (error, value) => {
+        if (finished) return
+        finished = true; init.signal?.removeEventListener('abort', abort)
+        error ? reject(error) : resolve(value)
     }
-
-    const extractVideoPath = (urlStr) => {
-        if (typeof urlStr !== 'string') return null
-        try {
-            const u = new URL(urlStr.startsWith('//') ? `https:${urlStr}` : urlStr)
-            // 提取路径+查询串（排除 host），用于拼到其他 CDN 节点上验证
-            if (u.pathname && u.pathname.length > 5) {
-                return { path: u.pathname + u.search, host: u.hostname }
+    const abort = () => { finish(new DOMException('请求已取消', 'AbortError')); request?.abort() }
+    if (init.signal?.aborted) { abort(); return }
+    init.signal?.addEventListener('abort', abort, { once: true })
+    request = GM_xmlhttpRequest({ method: 'GET', url, responseType: 'arraybuffer', anonymous: true,
+        headers: { ...init.headers, Referer: 'https://www.bilibili.com/' }, timeout: init.timeout,
+        onprogress: e => {
+            if (e.loaded > init.maxBytes) { finish(new Error('服务器忽略 Range 或返回过量数据')); request?.abort() }
+        },
+        onload: r => {
+            const headers = new Headers()
+            for (const line of (r.responseHeaders || '').split(/\r?\n/)) {
+                const i = line.indexOf(':')
+                if (i > 0) { try { headers.append(line.slice(0, i), line.slice(i + 1).trim()) } catch (_) {} }
             }
-        } catch (_) {}
-        return null
+            try {
+                if (!r.status) throw new TypeError('响应状态不可读取，内容未知')
+                const body = r.response || new ArrayBuffer(0)
+                if (body.byteLength > init.maxBytes) throw new Error('响应超过 Range 限额')
+                const response = new Response(body, { status: r.status, headers })
+                Object.defineProperty(response, 'url', { value: r.finalUrl || url }); finish(null, response)
+            } catch (e) { finish(e) }
+        },
+        onerror: () => finish(new TypeError('网络不可达或跨域权限未授予，内容未知')),
+        ontimeout: () => finish(new Error('请求超时')),
+        onabort: () => finish(new DOMException('请求已取消', 'AbortError')),
+    })
+})
+const playback = () => {
+    const v = document.querySelector('video')
+    let buffer = 0
+    if (v) for (let i = 0; i < v.buffered.length; i++) {
+        if (v.buffered.start(i) <= v.currentTime && v.currentTime <= v.buffered.end(i)) buffer = v.buffered.end(i) - v.currentTime
     }
-
-    const deepReplacePlayInfo = (obj) => {
-        if (!obj || typeof obj !== 'object') return
-        if (Array.isArray(obj)) {
-            for (let i = 0; i < obj.length; i++) {
-                const item = obj[i]
-                if (typeof item === 'string') {
-                    // 顺手采集视频探针路径
-                    if (!videoProbePath && hasMediaDomain(item)) {
-                        const probe = extractVideoPath(item)
-                        if (probe) videoProbePath = probe
-                    }
-                    const out = hasMediaDomain(item) ? replaceMediaUrl(item) : item
-                    if (out !== item) obj[i] = out
-                } else {
-                    deepReplacePlayInfo(item)
-                }
-            }
-            return
+    return { demand: !!v && !v.paused && !v.seeking && !v.ended, buffer }
+}
+const engine = Core.create({ transport: mediaTransport, config: mediaConfig, playback,
+    onStatus: event => {
+        if (event.state === '播放下载') diagnostics[event.kind] = event
+        diagnostics.events.push(event)
+        if (diagnostics.events.length > 50) diagnostics.events.shift()
+        document.dispatchEvent(new Event('ccb-status'))
+    },
+    refresh: async r => {
+        if (!lastPlayRequest) return null
+        const endpoint = new URL(lastPlayRequest)
+        // 媒体过期时旧 WBI 时间戳也可能过期，使用同参数的合法网页播放接口。
+        if (endpoint.pathname === '/x/player/wbi/playurl') {
+            endpoint.pathname = '/x/player/playurl'
+            endpoint.searchParams.delete('w_rid'); endpoint.searchParams.delete('wts')
         }
-        for (const k in obj) {
-            if (!Object.prototype.hasOwnProperty.call(obj, k)) continue
-            const v = obj[k]
-            if (typeof v === 'string') {
-                if (!videoProbePath && hasMediaDomain(v)) {
-                    const probe = extractVideoPath(v)
-                    if (probe) videoProbePath = probe
-                }
-                if (k === 'host') {
-                    if (hasMediaDomain(v)) obj[k] = replaceMediaHostValue(v)
-                } else {
-                    if (hasMediaDomain(v)) obj[k] = replaceMediaUrl(v)
-                }
-            } else if (Array.isArray(v) && k === 'backup_url') {
-                // 强力模式: 保留 backup_url 多样性，只用其他节点替换部分条目
-                // 不再全部替换为同一 CDN，避免单点故障导致视频加载失败
-                if (!getPowerMode()) continue
-                const regionNodes = getRegionCdnNodes(getRegion())
-                for (let i = 0; i < v.length; i++) {
-                    const s = v[i]
-                    if (typeof s === 'string') {
-                        if (hasMediaDomain(s)) {
-                            // 第 0 个 backup 用首选 CDN，其余用同地区不同节点做容灾
-                            if (i === 0) {
-                                v[i] = replaceMediaUrl(s)
-                            } else if (regionNodes.length > 0) {
-                                const altNode = regionNodes[i % regionNodes.length]
-                                const altUrl = 'https://' + altNode + '/'
-                                if (s.startsWith('http://') || s.startsWith('https://')) {
-                                    v[i] = s.replace(/^https?:\/\/.*?\//, altUrl)
-                                } else if (s.startsWith('//')) {
-                                    v[i] = s.replace(/^\/\/.*?\//, altUrl.replace(/^https?:/, ''))
-                                }
-                            }
-                        }
-                    }
-                    else deepReplacePlayInfo(s)
-                }
-            } else if (typeof v === 'object') {
-                deepReplacePlayInfo(v)
-            }
-        }
+        const response = await nativeFetch(endpoint.href, { credentials: 'include', cache: 'no-store' })
+        const data = await response.json()
+        if (data.code !== undefined && data.code !== 0) return null
+        registerPlayInfo(data)
+        return [...engine.resources].find(x => x.kind === r.kind && x.id === r.id) || null
     }
+})
+const registerPlayInfo = obj => {
+    const found = []
+    const visit = (value, kind = 'video', depth = 0) => {
+        if (!value || typeof value !== 'object' || depth > 12) return
+        if (Array.isArray(value)) { value.forEach(x => visit(x, kind, depth + 1)); return }
+        if (typeof (value.baseUrl || value.base_url) === 'string') found.push({ value, kind })
+        for (const [key, v] of Object.entries(value)) if (v && typeof v === 'object') visit(v, key === 'audio' ? 'audio' : key === 'video' ? 'video' : kind, depth + 1)
+    }
+    visit(obj)
+    if (!found.length) return
+    const fingerprint = found.map(x => x.value.baseUrl || x.value.base_url).join('\n')
+    if (fingerprint !== playFingerprint) { engine.reset(); playFingerprint = fingerprint; diagnostics.video = diagnostics.audio = null }
+    found.forEach(x => engine.register(x.value, x.kind))
+}
+const transformPlayUrlResponse = obj => {
+    if (!obj || typeof obj !== 'object' || (obj.code !== undefined && obj.code !== 0)) return
+    registerPlayInfo(obj)
+}
+const workerChannel = `ccb-${crypto.randomUUID()}`
+const buildWorkerPrelude = () => {
+    // ===WORKER_CORE_START===
+const workerCore = "/* CCB 媒体选源与 Range 调度内核。可在浏览器和 Node 测试中独立使用。 */\n;(function (root, factory) {\n    const api = factory()\n    if (typeof module === 'object' && module.exports) module.exports = api\n    else root.CcbCore = api\n})(typeof globalThis === 'object' ? globalThis : this, function () {\n    'use strict'\n    const MIRRORS = ['upos-sz-mirrorali.bilivideo.com', 'upos-sz-mirrorcos.bilivideo.com',\n        'upos-sz-mirrorhw.bilivideo.com', 'upos-sz-mirror08c.bilivideo.com']\n    const BUDGET = 16 * 1024 * 1024\n    const CHUNK = 512 * 1024\n    const abortError = () => new DOMException('请求已取消', 'AbortError')\n    const ordinary = value => {\n        try {\n            const u = new URL(value)\n            return u.protocol === 'https:' && /^upos-(?!tf-)[\\w-]+\\.bilivideo\\.com$/.test(u.hostname)\n                && !/-302(?:\\.|-)/.test(u.hostname) && u.pathname.startsWith('/upgcxcode/')\n                && u.searchParams.get('os') !== 'mcdn'\n        } catch (_) { return false }\n    }\n    const host = value => { try { return new URL(value).hostname } catch (_) { return '' } }\n    const swap = (value, node) => {\n        if (!ordinary(value)) return null\n        try {\n            const u = new URL(value), n = new URL(node.includes('://') ? node : `https://${node}`)\n            if (n.protocol !== 'https:' || !/^(?:upos-[\\w-]+|cn-[\\w-]+)\\.bilivideo\\.com$/.test(n.hostname)) return null\n            u.hostname = n.hostname; u.port = ''\n            return u.href\n        } catch (_) { return null }\n    }\n    const range = value => {\n        const m = /^bytes=(\\d+)-(\\d+)$/.exec(value || '')\n        if (!m) return null\n        const start = Number(m[1]), end = Number(m[2])\n        return Number.isSafeInteger(end) && end >= start ? { start, end, size: end - start + 1 } : null\n    }\n    const contentRange = value => {\n        const m = /^bytes (\\d+)-(\\d+)\\/(\\d+)$/.exec(value || '')\n        if (!m) return null\n        const [start, end, total] = m.slice(1).map(Number)\n        return [start, end, total].every(Number.isSafeInteger) && start <= end && end < total ? { start, end, total } : null\n    }\n    const sameBytes = (a, b) => a.length === b.length && a.every((v, i) => v === b[i])\n    const expiry = value => {\n        try {\n            const p = new URL(value).searchParams\n            const e = p.get('deadline') || p.get('expires')\n            return e && /^\\d+$/.test(e) ? Number(e) * 1000 : Infinity\n        } catch (_) { return 0 }\n    }\n    const makeResponse = (bytes, headers, url, status = 206) => {\n        const h = new Headers(headers)\n        h.delete('content-encoding'); h.delete('transfer-encoding'); h.set('content-length', String(bytes.byteLength))\n        const r = new Response(bytes, { status, headers: h })\n        Object.defineProperty(r, 'url', { value: url })\n        return r\n    }\n\n    function create(options = {}) {\n        const transport = options.transport || ((url, init) => fetch(url, init))\n        const config = options.config || (() => ({}))\n        const now = options.now || Date.now\n        const resources = new Set(), urls = new Map(), active = new Set()\n        let lastVideo = null\n        let reserved = 0\n        const waiters = new Set()\n        const notify = event => options.onStatus?.({ time: now(), ...event })\n        const wake = () => { for (const f of [...waiters]) f() }\n        async function reserve(size, signal) {\n            if (signal.aborted) throw abortError()\n            if (reserved + size > BUDGET) await new Promise((resolve, reject) => {\n                const cancel = () => { waiters.delete(check); reject(abortError()) }\n                const check = () => {\n                    if (reserved + size <= BUDGET) { waiters.delete(check); signal.removeEventListener('abort', cancel); reserved += size; resolve() }\n                }\n                waiters.add(check); signal.addEventListener('abort', cancel, { once: true })\n            })\n            else reserved += size\n        }\n        function register(rep, kind = 'video') {\n            const primary = rep.baseUrl || rep.base_url\n            const backup = rep.backupUrl || rep.backup_url || rep.backup_url_list || []\n            if (typeof primary !== 'string') return null\n            const originals = [...new Set([primary, ...(Array.isArray(backup) ? backup : [])].filter(v => {\n                try { const u = new URL(v); return u.protocol === 'https:' && /(?:^|\\.)(?:bilivideo\\.(?:com|cn|net)|akamaized\\.net)$/.test(u.hostname) } catch (_) { return false }\n            }))]\n            if (!originals.length) return null\n            const key = `${kind}:${rep.id || ''}:${primary}`\n            let r = [...resources].find(x => x.key === key)\n            if (!r) {\n                r = { key, kind, id: rep.id, primary, originals, bandwidth: Number(rep.bandwidth) || 0,\n                    probes: new Map(), health: new Map(), parallel: true, expanded: false,\n                    switchedAt: 0, windows: [], windowAt: now(), windowBytes: 0, threads: 4 }\n                resources.add(r)\n            }\n            for (const u of originals) urls.set(u, r)\n            for (const u of candidates(r)) urls.set(u, r)\n            return r\n        }\n        function candidates(r) {\n            const c = config(), preferred = c.preferred\n            if (c.enabled === false) return r.originals\n            if (r.kind === 'audio' && c.audioOriginal) return [...r.originals.slice(1), r.primary]\n            const nodes = [preferred, ...MIRRORS, ...(c.shenzhen || []).slice(0, 2)].filter(v => typeof v === 'string' && v)\n            const chosen = swap(r.originals.find(ordinary) || '', preferred || '')\n            const local = [...new Set([chosen, ...nodes.filter(n => host(`https://${n}`)?.includes('-sz-')).map(n => swap(r.originals.find(ordinary) || '', n))].filter(Boolean))]\n            const others = [...r.originals.slice(1), ...MIRRORS.map(n => swap(r.originals.find(ordinary) || '', n)), r.primary]\n            const banned = new Set(c.blacklist || [])\n            return [...new Set([...local, ...others].filter(Boolean))].filter(u => !banned.has(host(u)))\n        }\n        const isLocal = (r, u) => u === swap(r.originals.find(ordinary) || '', config().preferred || '') || host(u).includes('-sz-')\n        function failure(r, u, error) {\n            if (error?.name === 'AbortError') return\n            const h = r.health.get(u) || { failures: 0, blockedUntil: 0 }\n            h.failures++\n            if (h.failures >= 2) h.blockedUntil = now() + 60000\n            r.health.set(u, h)\n            notify({ kind: r.kind, node: host(u), reason: error.message || '请求失败', state: '冷却', blockedUntil: h.blockedUntil })\n        }\n        function sample(r, u, bytes, ms, finalUrl) {\n            const bps = bytes * 1000 / Math.max(ms, 1)\n            const h = r.health.get(u) || { failures: 0, blockedUntil: 0 }\n            h.bps = h.bps ? h.bps * .7 + bps * .3 : bps; h.failures = 0; h.blockedUntil = 0\n            r.health.set(u, h)\n            notify({ kind: r.kind, node: host(finalUrl || u), requestedNode: host(u), bps,\n                state: '播放下载', reason: finalUrl && host(finalUrl) !== host(u) ? '服务端重定向' : r.expanded ? '首选池不可用或持续过慢，已回退' : '首选池' })\n            const playback = options.playback?.() || {}\n            if (!playback.demand) { r.windows = []; r.windowBytes = 0; r.windowAt = now(); return }\n            r.windowBytes += bytes\n            const elapsed = now() - r.windowAt\n            if (elapsed >= 5000) {\n                r.windows.push(r.windowBytes * 8000 / elapsed); r.windows = r.windows.slice(-2)\n                r.windowBytes = 0; r.windowAt = now()\n                if (playback.demand && playback.buffer < 10 && r.bandwidth > 0 && r.windows.length === 2\n                    && r.windows.every(v => v < r.bandwidth * 1.3) && now() - r.switchedAt >= 30000) {\n                    r.expanded = true; r.switchedAt = now()\n                }\n                if (config().threads === 'auto' || !config().threads) {\n                    r.threads = Math.max(2, Math.min(8, r.threads + (playback.demand && playback.buffer < 10 ? 1 : -1)))\n                }\n            }\n        }\n        async function readRange(u, start, end, signal, timeout = 8000) {\n            if (signal?.aborted) throw abortError()\n            const ctrl = new AbortController()\n            const cancel = () => ctrl.abort()\n            signal?.addEventListener('abort', cancel, { once: true })\n            const timer = setTimeout(cancel, timeout)\n            try {\n                const response = await transport(u, { method: 'GET', headers: { Range: `bytes=${start}-${end}` },\n                    signal: ctrl.signal, timeout, maxBytes: end - start + 1 })\n                if (!response.status || response.type === 'opaque') throw new TypeError('响应不可读取，内容未知')\n                if (response.status !== 206) throw Object.assign(new Error(`HTTP ${response.status}，未返回有效分片`), { status: response.status })\n                const cr = contentRange(response.headers.get('content-range'))\n                if (!cr || cr.start !== start || cr.end !== Math.min(end, cr.total - 1)) throw new Error('Content-Range 不匹配')\n                const bytes = new Uint8Array(await response.arrayBuffer())\n                if (bytes.length !== cr.end - cr.start + 1) throw new Error('分片长度不匹配')\n                return { bytes, cr, headers: response.headers, url: response.url || u }\n            } catch (e) {\n                if (ctrl.signal.aborted && !signal?.aborted) throw new Error('请求超时')\n                throw e\n            } finally { clearTimeout(timer); signal?.removeEventListener('abort', cancel) }\n        }\n        async function probe(r, u, signal, size = 65536) {\n            const old = r.probes.get(u)\n            if (old && old.until > now() && size === 65536) return old\n            if (expiry(u) <= now() + 1000) return { state: 'expired', hasContent: false, url: u }\n            const started = now()\n            try {\n                const data = await readRange(u, 0, size - 1, signal, 3000)\n                const result = { ...data, state: 'valid', hasContent: true, bps: data.bytes.length * 1000 / Math.max(now() - started, 1),\n                    until: Math.min(now() + 90000, expiry(u)), source: u }\n                if (size === 65536) r.probes.set(u, result)\n                notify({ kind: r.kind, node: host(data.url), state: '已验证', bps: result.bps })\n                return result\n            } catch (e) {\n                if (signal?.aborted) throw e\n                const result = { state: e instanceof TypeError ? 'unknown' : 'invalid', hasContent: e instanceof TypeError ? null : false, error: e, until: now() + 15000 }\n                if (size === 65536) r.probes.set(u, result)\n                failure(r, u, e)\n                return result\n            }\n        }\n        function compatible(a, b) {\n            if (a.cr.total !== b.cr.total || !sameBytes(a.bytes, b.bytes)) return false\n            const ae = a.headers.get('etag'), be = b.headers.get('etag')\n            const strong = ae && be && !ae.startsWith('W/') && ae === be\n            const au = new URL(a.source), bu = new URL(b.source)\n            return !!strong || au.pathname + au.search === bu.pathname + bu.search\n        }\n        async function eligible(r, signal) {\n            let pool = candidates(r).filter(u => (r.health.get(u)?.blockedUntil || 0) <= now())\n            const local = pool.filter(u => isLocal(r, u))\n            if (!r.expanded && local.length) pool = local\n            else if (r.expanded) pool = [...local.slice(0, 3), ...pool.filter(u => !isLocal(r, u)).slice(0, 3)]\n            pool = pool.slice(0, 6)\n            let out = []\n            // 分批验活，首批最多六个；无可用节点再检查余下节点。\n            for (let i = 0; i < pool.length && !out.length; i += 6) {\n                const batch = pool.slice(i, i + 6)\n                for (let j = 0; j < batch.length; j += 3) {\n                    const results = await Promise.all(batch.slice(j, j + 3).map(async u => ({ u, p: await probe(r, u, signal) })))\n                    out.push(...results.filter(x => x.p.state === 'valid'))\n                }\n            }\n            if (!out.length && !r.expanded) { r.expanded = true; r.switchedAt = now(); return eligible(r, signal) }\n            const preferred = swap(r.originals.find(ordinary) || '', config().preferred || '')\n            const speed = x => r.health.get(x.u)?.bps || x.p.bps\n            out.sort((a, b) => (!r.expanded && a.u === preferred ? -1 : !r.expanded && b.u === preferred ? 1 : speed(b) - speed(a)))\n            if (out.length) out = out.filter(x => compatible(out[0].p, x.p))\n            return out\n        }\n        async function route(input, init = {}) {\n            const u = typeof input === 'string' ? input : input.url\n            const r = urls.get(u), c = config()\n            if (!r || c.enabled === false) return null\n            if (r.kind === 'video') lastVideo = r\n            const headers = new Headers(init.headers || (typeof input !== 'string' ? input.headers : undefined))\n            const wanted = range(headers.get('range'))\n            if ((init.method || input.method || 'GET').toUpperCase() !== 'GET' || !wanted || wanted.size > BUDGET) {\n                notify({ kind: r.kind, state: '原生下载', reason: '非有限 Range 请求或超过 16 MiB' }); return null\n            }\n            if (!r.originals.some(ordinary)) {\n                notify({ kind: r.kind, state: '原生下载', node: host(u), reason: '特殊路径或 M CDN，保留原始地址' }); return null\n            }\n            const ctrl = new AbortController(), signal = init.signal || input.signal\n            const cancel = () => ctrl.abort()\n            if (signal?.aborted) throw abortError()\n            signal?.addEventListener('abort', cancel, { once: true }); active.add(ctrl)\n            let allocated = false\n            try {\n                await reserve(wanted.size, ctrl.signal); allocated = true\n                const available = await eligible(r, ctrl.signal)\n                if (!available.length) {\n                    const signatureFailure = r.originals.every(x => expiry(x) <= now() + 1000)\n                        || r.originals.some(x => r.probes.get(x)?.error?.status === 403)\n                    if (signatureFailure && !r.refreshTried && options.refresh) {\n                        r.refreshTried = true\n                        // 刷新地址会清空旧资源；先释放旧请求占用，避免递归等待预算。\n                        reserved -= wanted.size; allocated = false; wake(); active.delete(ctrl)\n                        try {\n                            const fresh = await options.refresh(r)\n                            if (fresh) { fresh.refreshTried = true; return await route(fresh.primary, init) }\n                        } catch (e) { if (signal?.aborted) throw e }\n                    }\n                    notify({ kind: r.kind, state: '原生下载', reason: '没有已验证的兼容节点' })\n                    return null\n                }\n                const total = available[0].p.cr.total\n                if (wanted.end >= total) return null\n                const threads = c.acceleration === false || !r.parallel || !r.originals.some(ordinary) ? 1\n                    : c.threads && c.threads !== 'auto' ? Math.max(2, Math.min(8, Number(c.threads) || 4)) : r.threads\n                const output = new Uint8Array(wanted.size)\n                let cursor = wanted.start, lastUrl = available[0].u\n                const group = new AbortController()\n                const groupCancel = () => group.abort()\n                ctrl.signal.addEventListener('abort', groupCancel, { once: true })\n                const task = async index => {\n                    while (cursor <= wanted.end) {\n                        const start = cursor, end = Math.min(start + CHUNK - 1, wanted.end); cursor = end + 1\n                        let good = false, error\n                        for (let attempt = 0; attempt < 3; attempt++) {\n                            if (group.signal.aborted) throw abortError()\n                            const target = available[(index + attempt) % available.length]\n                            try {\n                                const started = now(), part = await readRange(target.u, start, end, group.signal)\n                                const etag = part.headers.get('etag'), initial = target.p.headers.get('etag')\n                                if (part.cr.total !== total || (etag && initial && etag !== initial)) throw new Error('资源在下载期间发生变化')\n                                output.set(part.bytes, start - wanted.start); lastUrl = part.url\n                                sample(r, target.u, part.bytes.length, now() - started, part.url); good = true; break\n                            } catch (e) { error = e; if (group.signal.aborted) throw e; failure(r, target.u, e) }\n                        }\n                        if (!good) throw error\n                    }\n                }\n                const tasks = Array.from({ length: Math.min(threads, Math.ceil(wanted.size / CHUNK)) }, (_, i) => task(i))\n                try { await Promise.all(tasks) }\n                catch (e) {\n                    group.abort(); await Promise.allSettled(tasks)\n                    if (ctrl.signal.aborted) throw abortError()\n                    r.parallel = false; notify({ kind: r.kind, state: '单连接降级', reason: e.message })\n                    try {\n                        const part = await readRange(r.primary, wanted.start, wanted.end, ctrl.signal)\n                        return makeResponse(part.bytes, part.headers, part.url)\n                    } catch (fallbackError) {\n                        if (fallbackError.status === 403 && !r.refreshTried && options.refresh) {\n                            r.refreshTried = true; reserved -= wanted.size; allocated = false; wake(); active.delete(ctrl)\n                            const fresh = await options.refresh(r)\n                            if (fresh) { fresh.refreshTried = true; return await route(fresh.primary, init) }\n                        }\n                        throw fallbackError\n                    }\n                } finally { ctrl.signal.removeEventListener('abort', groupCancel) }\n                const outHeaders = new Headers(available[0].p.headers)\n                outHeaders.set('content-range', `bytes ${wanted.start}-${wanted.end}/${total}`)\n                return makeResponse(output, outHeaders, lastUrl)\n            } finally {\n                if (allocated) { reserved -= wanted.size; wake() }\n                active.delete(ctrl); signal?.removeEventListener('abort', cancel)\n            }\n        }\n        const cancel = () => { for (const c of active) c.abort() }\n        const reset = () => { cancel(); resources.clear(); urls.clear(); lastVideo = null }\n        return { register, route, probe, candidates, resources, reset, cancel,\n            resourceFor: url => urls.get(url),\n            first: () => lastVideo || [...resources].find(r => r.kind === 'video'),\n            inspect: () => ({ resources: resources.size, reserved, active: active.size }) }\n    }\n\n    // XHR 只接管异步 GET arraybuffer 分片，其余请求保留浏览器原生行为。\n    function xhrAdapter(Native, route) {\n        return class extends Native {\n            open(method, url, async = true, ...rest) {\n                this._ccb = null; this._ccbReq = { method, url: String(url), async, headers: {} }\n                return super.open(method, url, async, ...rest)\n            }\n            setRequestHeader(k, v) { if (this._ccbReq) this._ccbReq.headers[k] = v; return super.setRequestHeader(k, v) }\n            get readyState() { return this._ccb ? this._ccb.readyState : super.readyState }\n            get status() { return this._ccb ? this._ccb.status : super.status }\n            get statusText() { return this._ccb ? this._ccb.statusText : super.statusText }\n            get responseURL() { return this._ccb ? this._ccb.url : super.responseURL }\n            get response() { return this._ccb ? this._ccb.body : super.response }\n            get responseText() { if (this._ccb) throw new DOMException('响应类型为 arraybuffer', 'InvalidStateError'); return super.responseText }\n            getAllResponseHeaders() { return this._ccb ? [...this._ccb.headers].map(([k, v]) => `${k}: ${v}\\r\\n`).join('') : super.getAllResponseHeaders() }\n            getResponseHeader(k) { return this._ccb ? this._ccb.headers.get(k) : super.getResponseHeader(k) }\n            send(body) {\n                const req = this._ccbReq\n                if (!req || !req.async || req.method.toUpperCase() !== 'GET' || this.responseType !== 'arraybuffer'\n                    || this.withCredentials || body != null || !range(new Headers(req.headers).get('range'))) return super.send(body)\n                if (this._ccbCtrl) throw new DOMException('请求已经发送', 'InvalidStateError')\n                const ctrl = new AbortController(); this._ccbCtrl = ctrl\n                let timedOut = false\n                const timer = this.timeout ? setTimeout(() => { timedOut = true; ctrl.abort() }, this.timeout) : null\n                const emit = type => this.dispatchEvent(new Event(type))\n                Promise.resolve().then(() => route(req.url, { method: req.method, headers: req.headers, signal: ctrl.signal }))\n                    .then(async response => {\n                        if (ctrl.signal.aborted) throw abortError()\n                        if (!response) { clearTimeout(timer); this._ccbCtrl = null; return super.send(body) }\n                        this._ccb = { readyState: 2, status: response.status, statusText: response.statusText, url: response.url, headers: response.headers, body: null }\n                        emit('loadstart'); emit('readystatechange')\n                        this._ccb.readyState = 3; emit('readystatechange')\n                        this._ccb.body = await response.arrayBuffer()\n                        if (ctrl.signal.aborted) throw abortError()\n                        this._ccb.readyState = 4; emit('readystatechange')\n                        this.dispatchEvent(new ProgressEvent('progress', { lengthComputable: true, loaded: this._ccb.body.byteLength, total: this._ccb.body.byteLength }))\n                        emit('load'); emit('loadend')\n                    }).catch(e => {\n                        this._ccb = { readyState: ctrl.signal.aborted && !timedOut ? 0 : 4, status: 0, statusText: '', url: '', headers: new Headers(), body: null }\n                        emit('readystatechange'); emit(timedOut ? 'timeout' : e.name === 'AbortError' ? 'abort' : 'error'); emit('loadend')\n                    }).finally(() => { clearTimeout(timer); if (this._ccbCtrl === ctrl) this._ccbCtrl = null })\n            }\n            abort() { if (this._ccbCtrl) this._ccbCtrl.abort(); else super.abort() }\n        }\n    }\n    return { create, xhrAdapter, ordinary, swap, range, contentRange, MIRRORS, BUDGET, CHUNK }\n})\n";
+// ===WORKER_CORE_END===
+    return `${workerCore}\n;(${ccbWorkerRuntime.toString()})(${JSON.stringify(workerChannel)});\n`
+}
 
-    const transformPlayUrlResponse = (playInfo) => {
-        if (!playInfo || typeof playInfo !== 'object') return
-        if (playInfo.code !== (void 0) && playInfo.code !== 0) return
-        deepReplacePlayInfo(playInfo)
-    }
+// ===INTEGRATION_END===
 
     const transformLiveNeptune = (obj) => {
         if (!obj || typeof obj !== 'object') return
@@ -1011,7 +1425,15 @@ const EMBEDDED = {
                     if (!Array.isArray(infos)) continue
                     for (let ii = 0; ii < infos.length; ii++) {
                         const info = infos[ii]
-                        if (info && typeof info.host === 'string') info.host = replaceMediaHostValue(info.host)
+                        if (ii === 0 && info && typeof info.host === 'string') {
+                            const originalHost = info.host
+                            const replacementHost = replaceMediaHostValue(originalHost)
+                            if (replacementHost !== originalHost) {
+                                if (!infos.some(x => x !== info && x.host === originalHost)) infos.splice(1, 0, { ...info })
+                                if (c.base_url) liveRoutes.set(replacementHost + c.base_url + (info.extra || ''), originalHost + c.base_url + (info.extra || ''))
+                                info.host = replacementHost
+                            }
+                        }
                     }
                 }
             }
@@ -1019,96 +1441,8 @@ const EMBEDDED = {
     }
 
     const replaceBilivideoInText = (text) => {
-        if (!shouldApplyReplacement()) return text
-        if (typeof text !== 'string') return text
-        if (text.indexOf('bilivideo.') === -1
-            && text.indexOf('acgvideo.') === -1
-            && text.indexOf('edge.mountaintoys.cn') === -1
-            && text.indexOf('akamaized.net') === -1
-        ) return text
-        const out = text.replace(/https?:\/\/[^"'\s]*?\.(?:(?:bilivideo|acgvideo)\.(?:com|cn)|edge\.mountaintoys\.cn|akamaized\.net)\//g, getReplacement())
-        const host = getReplacementHost()
-        if (!host) return out
-        return out.replace(/\b[\w.-]+\.(?:(?:bilivideo|acgvideo)\.(?:com|cn)|edge\.mountaintoys\.cn|akamaized\.net)\b/g, host)
-    }
-
-    const installCcbWorkerRuntime = (cfg) => {
-        const forceReplace = !!(cfg && cfg.forceReplace)
-        const shouldApply = () => forceReplace
-        const Replacement = (cfg && typeof cfg.replacement === 'string') ? cfg.replacement : ''
-        const replacementHost = (cfg && typeof cfg.replacementHost === 'string') ? cfg.replacementHost : ''
-        const getHost = () => replacementHost
-        const IgnoreHostRe = /^(?:bvc|data|pbp|api|api\w+)\./
-        const hasMedia = (s) => typeof s === 'string' && (
-            s.indexOf('bilivideo.') !== -1
-            || s.indexOf('acgvideo.') !== -1
-            || s.indexOf('edge.mountaintoys.cn') !== -1
-            || s.indexOf('akamaized.net') !== -1
-        )
-
-        const replaceUrl = (s) => {
-            if (typeof s !== 'string') return s
-            if (!shouldApply()) return s
-            if (!hasMedia(s)) return s
-            try {
-                const u = new URL(s.startsWith('//') ? `https:${s}` : s)
-                if (IgnoreHostRe.test(u.hostname)) return s
-            } catch (_) {
-                const m = s.match(/^https?:\/\/([\w.-]+)/) || s.match(/^\/\/([\w.-]+)/)
-                if (m && IgnoreHostRe.test(m[1])) return s
-            }
-            if (s.startsWith('http://') || s.startsWith('https://')) return s.replace(/^https?:\/\/.*?\//, Replacement)
-            if (s.startsWith('//')) return s.replace(/^\/\/.*?\//, Replacement.replace(/^https?:/, ''))
-            if (/^[^/]+\//.test(s)) return s.replace(/^[^/]+\//, `${getHost()}/`)
-            return s
-        }
-
-        const Ofetch = self.fetch
-        if (Ofetch) {
-            self.fetch = (input, init) => {
-                try {
-                    const s = typeof input === 'string' ? input : (input && input.url)
-                    if (typeof s === 'string') {
-                        const r = replaceUrl(s)
-                        if (r !== s) {
-                            if (typeof input === 'string') input = r
-                            else {
-                                const Req = self.Request || Request
-                                if (Req) input = new Req(r, input)
-                            }
-                        }
-                    }
-                } catch (_) {}
-                return Ofetch(input, init)
-            }
-        }
-
-        if (self.XMLHttpRequest) {
-            const OX = self.XMLHttpRequest
-            class X extends OX {
-                open(...args) {
-                    try {
-                        if (typeof args[1] === 'string') args[1] = replaceUrl(args[1])
-                    } catch (_) {}
-                    return super.open(...args)
-                }
-            }
-            self.XMLHttpRequest = X
-        }
-    }
-
-    const buildWorkerPrelude = () => {
-        const cfg = {
-            forceReplace: shouldApplyReplacement(),
-            replacement: getReplacement(),
-            replacementHost: getReplacementHost(),
-        }
-        const runtime = `(${installCcbWorkerRuntime.toString()})(${JSON.stringify(cfg)});`
-        return `(() => {\n` +
-            `  if (self.__CCB_WORKER_PRELUDE__) return;\n` +
-            `  self.__CCB_WORKER_PRELUDE__ = true;\n` +
-            `  try { ${runtime} } catch (_) {}\n` +
-            `})();\n`
+        // 无法识别的直播文本不整体替换，保留原生签名及故障转移信息。
+        return text
     }
 
     const interceptNetResponse = (theWindow => {
@@ -1126,9 +1460,12 @@ const EMBEDDED = {
                 const hooked = w.__CCB_NET_HOOKED__
                 if (hooked && hooked.xhr === w.XMLHttpRequest && hooked.fetch === w.fetch) return true
 
-                const OX = w.XMLHttpRequest
+                const OX = Core.xhrAdapter(w.XMLHttpRequest, (url, init) => engine.route(url, init))
                 class XHR extends OX {
                     open(...args) {
+                        this._ccbMemo = null
+                        const requestUrl = String(args[1])
+                        this.addEventListener('load', () => { if (!this._ccb) noteNative(requestUrl, this.responseURL) }, { once: true })
                         try {
                             if (typeof args[1] === 'string') args[1] = replaceMediaUrl(args[1])
                         } catch (_) {}
@@ -1136,38 +1473,54 @@ const EMBEDDED = {
                     }
                     get responseText() {
                         if (this.readyState !== this.DONE) return super.responseText
-                        return handle(super.responseText, this.responseURL, { type: 'xhr', xhr: this })
+                        const original = super.responseText
+                        if (this._ccbMemo && this._ccbMemo.original === original) return this._ccbMemo.value
+                        const value = handle(original, this.responseURL, { type: 'xhr', xhr: this })
+                        this._ccbMemo = { original, value }
+                        return value
                     }
                     get response() {
                         if (this.readyState !== this.DONE) return super.response
+                        if (this.responseType === '' || this.responseType === 'text') return this.responseText
                         return handle(super.response, this.responseURL, { type: 'xhr', xhr: this })
                     }
                 }
                 w.XMLHttpRequest = XHR
 
-                const Ofetch = w.fetch
-                w.fetch = (input, init) => {
-                    const s0 = typeof input === 'string' ? input : (input && input.url)
-                    if (typeof s0 === 'string') {
-                        const r = replaceMediaUrl(s0)
-                        if (r !== s0) {
-                            if (typeof input === 'string') input = r
-                            else input = new (w.Request || Request)(r, input)
-                        }
+                const Ofetch = w.fetch.bind(w)
+                w.fetch = async (input, init) => {
+                    const request = new (w.Request || Request)(input, init)
+                    const media = await engine.route(request.url, { method: request.method, headers: request.headers, signal: request.signal })
+                    if (media) return media
+                    const url = request.url
+                    const shouldIntercept = handle(null, url, { type: 'fetch', input, init })
+                    let resp, liveRetried = false
+                    try { resp = await Ofetch(request) }
+                    catch (error) {
+                        if (!liveRoutes.has(url) || request.signal.aborted) throw error
+                        liveRetried = true
+                        resp = await Ofetch(new (w.Request || Request)(liveRoutes.get(url), request))
                     }
-
-                    const s = typeof input === 'string' ? input : (input && input.url)
-                    let resolvedUrl = s
-                    try { resolvedUrl = new URL(s, w.location && w.location.href ? w.location.href : location.href).href } catch (_) {}
-
-                    const shouldIntercept = handle(null, resolvedUrl, { type: 'fetch', input, init })
-                    if (!shouldIntercept) return Ofetch(input, init)
-                    return Ofetch(input, init).then(resp => new Promise((resolve) => {
-                        resp.text().then(text => {
-                            const out = handle(text, resolvedUrl, { type: 'fetch', input, init, response: resp })
-                            resolve(new (w.Response || Response)(out, { status: resp.status, statusText: resp.statusText, headers: resp.headers }))
-                        })
-                    }))
+                    noteNative(url, resp.url)
+                    if (liveRoutes.has(url)) {
+                        if (!resp.ok && !liveRetried) {
+                            resp.body?.cancel().catch(() => {})
+                            resp = await Ofetch(new (w.Request || Request)(liveRoutes.get(url), request))
+                        }
+                        diagnostics.events.push({ time: Date.now(), kind: 'live', node: new URL(resp.url || url).hostname,
+                            state: '直播原生下载', reason: resp.url !== url ? '原始备用源或重定向' : '所选直播源' })
+                        if (diagnostics.events.length > 50) diagnostics.events.shift()
+                        document.dispatchEvent(new Event('ccb-status'))
+                    }
+                    if (!shouldIntercept) return resp
+                    if (!resp.body || [204, 205, 304].includes(resp.status)) return resp
+                    const text = await resp.text()
+                    const out = handle(text, url, { type: 'fetch', input, init, response: resp })
+                    const headers = new Headers(resp.headers)
+                    headers.delete('content-length'); headers.delete('content-encoding')
+                    const response = new (w.Response || Response)(out, { status: resp.status, statusText: resp.statusText, headers })
+                    Object.defineProperty(response, 'url', { value: resp.url })
+                    return response
                 }
 
                 try {
@@ -1185,6 +1538,8 @@ const EMBEDDED = {
 
                             return new OBlob(parts, options)
                         }
+                        w.Blob.prototype = OBlob.prototype
+                        Object.setPrototypeOf(w.Blob, OBlob)
                         w.__CCB_BLOB_HOOKED__ = w.Blob
                     }
                 } catch (_) {}
@@ -1197,18 +1552,22 @@ const EMBEDDED = {
                             try {
                                 if (!shouldInstallWorkerHooks()) return new OWorker(scriptURL, options)
                                 const raw = (typeof scriptURL === 'string') ? scriptURL : String(scriptURL)
-                                if (raw.startsWith('blob:') || raw.startsWith('data:')) return new OWorker(scriptURL, options)
+                                if (raw.startsWith('blob:') || raw.startsWith('data:')) return ccbAttachWorker(new OWorker(scriptURL, options), workerChannel, engine, noteNative)
                                 const isModule = options && options.type === 'module'
                                 const wrapperCode = isModule
                                     ? `${buildWorkerPrelude()}\nimport ${JSON.stringify(raw)};\n`
                                     : `${buildWorkerPrelude()}\nimportScripts(${JSON.stringify(raw)});\n`
                                 const blob = new w.Blob([wrapperCode], { type: 'application/javascript' })
                                 const url = w.URL.createObjectURL(blob)
-                                return new OWorker(url, options)
+                                const worker = ccbAttachWorker(new OWorker(url, options), workerChannel, engine, noteNative)
+                                setTimeout(() => w.URL.revokeObjectURL(url), 60000)
+                                return worker
                             } catch (_) {
                                 return new OWorker(scriptURL, options)
                             }
                         }
+                        w.Worker.prototype = OWorker.prototype
+                        Object.setPrototypeOf(w.Worker, OWorker)
                         w.__CCB_WORKER_WRAPPED__ = w.Worker
                     }
                 } catch (_) {}
@@ -1240,6 +1599,7 @@ const EMBEDDED = {
         const u = typeof url === 'string' ? url : (url && url.url) || String(url)
         if (!PLAYURL_PATHS.some(p => u.includes(p))) return
         if (response === null) return true
+        lastPlayRequest = u
 
         try {
             if (typeof response === 'string') {
@@ -1350,8 +1710,6 @@ const EMBEDDED = {
         return btn
     }
 
-    let regionList = [manualRegionName]
-    let cdnDataCache = null
 
     const requestText = (url) => new Promise((resolve, reject) => {
         const fetchFallback = () => fetch(url).then(r => r.text()).then(resolve, reject)
@@ -1392,11 +1750,15 @@ const EMBEDDED = {
                     requestJson(`${src}/region.json`),
                     requestJson(`${src}/cdn.json`),
                 ])
+                if (!Array.isArray(regions) || !regions.every(v => typeof v === 'string')
+                    || !cdn || typeof cdn !== 'object' || Array.isArray(cdn)
+                    || !Object.values(cdn).every(v => Array.isArray(v) && v.every(n => typeof n === 'string' && /^[\w.-]+$/.test(n)))) throw new Error('节点数据结构错误')
                 if (Array.isArray(regions) && regions.length > 0) {
                     regionList = [manualRegionName, ...regions.filter(v => v && v !== manualRegionName && v !== '编辑')]
                 }
                 if (cdn && typeof cdn === 'object' && Object.keys(cdn).length > 0) {
                     cdnDataCache = cdn
+                    GM_setValue('CCB_data_v1', { regions, cdn, time: Date.now() }); invalidateConfig()
                 }
                 logger('在线更新数据成功，来源:', src)
                 return true
@@ -1405,6 +1767,17 @@ const EMBEDDED = {
         logger('所有在线源不可用，使用内嵌数据')
         return false
     }
+
+    setTimeout(tryOnlineUpdate, 5000)
+    try {
+        const cached = GM_getValue('CCB_data_v1', null)
+        if (cached && Date.now() - cached.time >= 0 && Date.now() - cached.time < 7 * 86400000
+            && Array.isArray(cached.regions) && cached.regions.every(x => typeof x === 'string')
+            && cached.cdn && Object.values(cached.cdn).every(v => Array.isArray(v)
+                && v.every(n => typeof n === 'string' && /^[\w.-]+$/.test(n)))) {
+            regionList = [manualRegionName, ...cached.regions]; cdnDataCache = cached.cdn; invalidateConfig()
+        }
+    } catch (_) {}
 
     const getRegionList = async () => {
         // 已有数据直接返回，后台静默更新
@@ -1432,877 +1805,191 @@ const EMBEDDED = {
         return [defaultCdnNode, ...sortByIsp(filtered, isp !== '全部' ? isp : null)]
     }
 
-    // ====== CDN 节点测速 ======
-    const speedTestCache = {}  // { nodeName: latency_ms }
-
-    // 单节点延迟测试：用 no-cors fetch 测 TCP+TLS 连接延迟，3s 超时
-    const testNodeLatency = (nodeName) => new Promise((resolve) => {
-        const url = `https://${nodeName}/`
-        const start = performance.now()
-        const ctrl = new AbortController()
-        const timer = setTimeout(() => { ctrl.abort(); resolve({ node: nodeName, latency: 3000, error: true }) }, 3000)
-        fetch(url, {
-            mode: 'no-cors',
-            cache: 'no-store',
-            credentials: 'omit',
-            signal: ctrl.signal,
-        }).then(() => {
-            clearTimeout(timer)
-            resolve({ node: nodeName, latency: Math.round(performance.now() - start), error: false })
-        }).catch((e) => {
-            clearTimeout(timer)
-            // 连接拒绝/网络错误也算失败，但仍记录耗时
-            resolve({ node: nodeName, latency: Math.round(performance.now() - start), error: true })
-        })
-    })
-
-    // 批量测速，并发上限 6，返回按延迟排序的结果
-    const runSpeedTest = async (nodes, onProgress) => {
-        const results = []
-        const CONCURRENCY = 6
-        const queue = [...nodes]
-
-        const worker = async () => {
-            while (queue.length > 0) {
-                const node = queue.shift()
-                const r = await testNodeLatency(node)
-                results.push(r)
-                if (onProgress) onProgress(results.length, nodes.length, r)
-            }
+    // ===PANEL_START===
+// 使用 DOM 文本接口构建面板，节点名与在线数据不会作为 HTML 执行。
+let panelOpening = false
+const openPanel = async () => {
+    const existing = document.querySelector('#ccb-settings-panel')
+    if (existing) { existing.remove(); return }
+    if (panelOpening) return
+    panelOpening = true
+    try {
+        const el = (tag, text, parent) => {
+            const node = document.createElement(tag)
+            if (text !== undefined) node.textContent = text
+            parent?.appendChild(node)
+            return node
         }
-
-        const workers = Array.from({ length: Math.min(CONCURRENCY, nodes.length) }, () => worker())
-        await Promise.all(workers)
-
-        // 排序：成功在前按延迟升序，失败排最后
-        results.sort((a, b) => {
-            if (a.error !== b.error) return a.error ? 1 : -1
-            return a.latency - b.latency
-        })
-        // 更新缓存
-        results.forEach(r => { speedTestCache[r.node] = r.error ? -1 : r.latency })
-        return results
-    }
-
-    // 节点失败计数（持久化到 GM storage），用于自动降权
-    const failCountStored = 'CCB_failCount'
-    const getFailCount = () => { try { return JSON.parse(GM_getValue(failCountStored, '{}')) } catch (_) { return {} } }
-    const addFailCount = (nodeName) => {
-        const fc = getFailCount()
-        fc[nodeName] = (fc[nodeName] || 0) + 1
-        GM_setValue(failCountStored, JSON.stringify(fc))
-    }
-    const getNodeFailCount = (nodeName) => { const fc = getFailCount(); return fc[nodeName] || 0 }
-
-    // 内容验活：用真实视频分片发 GET + Range 请求较大数据块 (8KB)
-    // no-cors 模式下看不到状态码，用传输耗时做启发式判断：
-    //   - 耗时 > 100ms：大概率有真实数据传输 → 有内容
-    // B站视频 URL 带节点绑定签名，换 host 后必然 403，所以验活改为测节点通用连通性：
-    // 去签名后发 HEAD 请求到视频路径，能响应（即使 403）说明节点在线且路径可路由
-    const contentOkCache = {}  // { nodeName: true/false/null }
-    const probeNodeContent = (nodeName) => new Promise((resolve) => {
-        if (!videoProbePath || !videoProbePath.path) {
-            return resolve({ node: nodeName, hasContent: null })
-        }
-        if (contentOkCache[nodeName] !== undefined) {
-            return resolve({ node: nodeName, hasContent: contentOkCache[nodeName] })
-        }
-        if (getNodeFailCount(nodeName) >= 1) {
-            contentOkCache[nodeName] = false
-            return resolve({ node: nodeName, hasContent: false })
-        }
-
-        // 去掉查询串（含节点绑定签名），只保留路径，避免 403 干扰判断
-        const cleanPath = videoProbePath.path.split('?')[0]
-        const url = `https://${nodeName}${cleanPath}`
-        const ctrl = new AbortController()
-        const timer = setTimeout(() => { ctrl.abort(); contentOkCache[nodeName] = false; resolve({ node: nodeName, hasContent: false }) }, 5000)
-        const t0 = performance.now()
-
-        fetch(url, {
-            method: 'HEAD',
-            mode: 'no-cors',
-            cache: 'no-store',
-            credentials: 'omit',
-            signal: ctrl.signal,
-        }).then(() => {
-            clearTimeout(timer)
-            const elapsed = performance.now() - t0
-            // 节点能响应（即使 403/404 也说明在线且路由正确），超时才是真死
-            const ok = elapsed < 4000  // 能连上就算 OK
-            contentOkCache[nodeName] = ok
-            resolve({ node: nodeName, hasContent: ok, latency: Math.round(elapsed) })
-        }).catch(() => {
-            clearTimeout(timer)
-            // fetch 失败（网络不可达），不是 CORS 错（no-cors 不会抛 CORS）
-            contentOkCache[nodeName] = false
-            resolve({ node: nodeName, hasContent: false })
-        })
-    })
-
-    // 对已测速结果中的前 N 个做内容验活
-    const probeTopNodes = async (speedResults, topN, onProbeProgress) => {
-        const candidates = speedResults.filter(r => !r.error).slice(0, topN)
-        if (candidates.length === 0) return []
-        const nodes = candidates.map(r => r.node)
-        const probeResults = []
-        const CONCURRENCY = 4
-        const queue = [...nodes]
-        const worker = async () => {
-            while (queue.length > 0) {
-                const node = queue.shift()
-                const pr = await probeNodeContent(node)
-                probeResults.push(pr)
-                if (onProbeProgress) onProbeProgress(probeResults.length, nodes.length, pr)
-            }
-        }
-        await Promise.all(Array.from({ length: Math.min(CONCURRENCY, nodes.length) }, () => worker()))
-        return probeResults
-    }
-
-    // 延迟着色
-    const latencyColor = (ms, error) => {
-        if (error) return '#666'
-        if (ms < 80) return '#0f0'
-        if (ms < 200) return '#ff0'
-        return '#f60'
-    }
-    // ====== END CDN 测速 ======
-
-    const openPanel = async () => {
-        const existing = document.querySelector('#ccb-settings-panel')
-        if (existing) {
-            existing.remove()
-            return
-        }
-
-        await getRegionList()
-
-        const root = document.createElement('div')
+        const root = el('div')
         root.id = 'ccb-settings-panel'
-        root.style.cssText = [
-            'position:fixed',
-            'z-index:2147483647',
-            'right:18px',
-            'top:18px',
-            'width:460px',
-            'max-width:calc(100vw - 36px)',
-            'max-height:calc(100vh - 36px)',
-            'overflow:auto',
-            'background:rgba(20,20,20,.96)',
-            'border:1px solid #333',
-            'border-radius:10px',
-            'box-shadow:0 8px 24px rgba(0,0,0,.35)',
-            'color:#fff',
-            'font-size:12px',
-            'font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,"PingFang SC","Microsoft YaHei",sans-serif',
-        ].join(';')
-
-        const header = document.createElement('div')
-        header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px;border-bottom:1px solid #2f2f2f'
-        const title = document.createElement('div')
-        title.textContent = 'CCB 设置'
-        title.style.cssText = 'font-weight:700;font-size:13px'
-        const closeBtn = createButton('关闭', false, false)
-        closeBtn.addEventListener('click', () => { try { root.remove() } catch (_) {} })
-        header.appendChild(title)
-        header.appendChild(closeBtn)
-        root.appendChild(header)
-
-        const body = document.createElement('div')
-        body.style.cssText = 'padding:12px'
-        root.appendChild(body)
-
-        const mkRow = (labelText) => {
-            const row = document.createElement('div')
-            row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:10px;margin:10px 0'
-            const label = document.createElement('div')
-            label.textContent = labelText
-            label.style.cssText = 'color:#bbb'
-            row.appendChild(label)
-            return { row, label }
+        root.style.cssText = 'position:fixed;z-index:2147483647;right:18px;top:18px;width:480px;max-width:calc(100vw - 36px);max-height:calc(100vh - 36px);overflow:auto;background:#151515;color:#eee;padding:16px;border:1px solid #555;border-radius:12px;font:13px/1.6 system-ui'
+        const button = (text, parent, handler) => {
+            const b = el('button', text, parent)
+            b.style.cssText = 'background:#303b50;color:white;border:1px solid #596579;border-radius:5px;padding:5px 10px;margin:4px;cursor:pointer'
+            b.addEventListener('click', handler); return b
         }
-
-        const mkSectionTitle = (text) => {
-            const t = document.createElement('div')
-            t.textContent = text
-            t.style.cssText = 'font-weight:700;font-size:12px;margin:2px 0 8px;color:#e5e5e5'
-            return t
+        const select = (parent, values, current, change) => {
+            const s = el('select', undefined, parent)
+            s.style.cssText = 'background:#222;color:white;padding:7px;width:100%;margin:4px 0'
+            if (!values.includes(current)) values = [...values, current]
+            values.forEach(v => { const o = el('option', v, s); o.value = v })
+            s.value = current; s.addEventListener('change', () => change(s.value)); return s
         }
-
-        const mkSectionBox = () => {
-            const box = document.createElement('div')
-            box.style.cssText = 'border:1px solid #2f2f2f;border-radius:10px;padding:10px;margin:10px 0;background:rgba(0,0,0,.12)'
-            return box
+        el('strong', 'CCB 2.3 · 设置与播放诊断', root)
+        button('关闭', root, () => root.remove())
+        el('p', '深圳优先；当前视频失败或持续过慢才回退。回退不会修改你的首选。地区来自域名标签，不保证服务器物理位置。', root)
+        const status = el('pre', undefined, root)
+        status.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere;background:#202020;padding:10px;border-radius:6px'
+        const updateStatus = () => {
+            const lines = [`首选：${getTargetCdnNode()}`]
+            for (const kind of ['video', 'audio']) {
+                const d = diagnostics[kind]
+                lines.push(`${kind === 'video' ? '视频' : '音频'}：${d ? `${d.node} · ${d.bps ? (d.bps / 1048576).toFixed(2) + ' MiB/s' : d.state}\n${d.reason || ''}` : '等待媒体请求'}`)
+            }
+            const last = diagnostics.events.at(-1)
+            if (last) lines.push(`最近状态：${last.state} ${last.node || ''} ${last.reason || ''}`)
+            status.textContent = lines.join('\n')
         }
-
-        const mkSelect = (options, value) => {
-            const sel = document.createElement('select')
-            sel.style.cssText = 'flex:1;background:#111;color:#fff;border:1px solid #333;border-radius:8px;padding:8px'
-            sel.innerHTML = options.map(v => `<option value="${v}">${v}</option>`).join('')
-            sel.value = value
-            return sel
-        }
-
-        const mkInput = (value) => {
-            const inp = document.createElement('input')
-            inp.type = 'text'
-            inp.placeholder = '输入节点域名或URL'
-            inp.style.cssText = 'flex:1;background:#111;color:#fff;border:1px solid #333;border-radius:8px;padding:8px;outline:none'
-            inp.value = value || ''
-            return inp
-        }
-
-        // ====== 全局 ISP 筛选 ======
-        const ispRefreshCallbacks = []
-        const currentIspFilter = getIspFilter()
-        const ispOptions = ['全部', '电信', '联通', '移动', '其他']
-        const { row: ispFilterRow } = mkRow('运营商筛选')
-        const ispSelect = mkSelect(ispOptions, currentIspFilter)
-        ispSelect.title = '根据 CDN 节点名称中的运营商标记 (ct/cu/cm) 筛选'
-        ispSelect.addEventListener('change', () => {
-            setIspFilter(ispSelect.value)
-            ispRefreshCallbacks.forEach(fn => { try { fn() } catch (_) {} })
+        updateStatus()
+        document.addEventListener('ccb-status', updateStatus)
+        const observer = new MutationObserver(() => {
+            if (!root.isConnected) { document.removeEventListener('ccb-status', updateStatus); observer.disconnect() }
         })
-        ispFilterRow.appendChild(ispSelect)
-        body.appendChild(ispFilterRow)
-
-        // 分隔线
-        const divider = document.createElement('div')
-        divider.style.cssText = 'border-top:1px solid #2f2f2f;margin:8px 0'
-        body.appendChild(divider)
-        // ====== END 全局 ISP 筛选 ======
-
-        // ====== 全局测速 ======
-        let globalTestRunning = false
-        const globalSpeedBox = document.createElement('div')
-        globalSpeedBox.style.cssText = 'display:none;margin:6px 0;max-height:300px;overflow-y:auto;font-size:11px;border:1px solid #333;border-radius:8px;padding:6px'
-        body.appendChild(globalSpeedBox)
-
-        const { row: globalRow } = mkRow('全局测速')
-        const globalTestBtn = document.createElement('button')
-        globalTestBtn.textContent = '🌐 测试全部地区'
-        globalTestBtn.title = '每个地区抽代表节点，测速后按地区排序'
-        globalTestBtn.style.cssText = 'border:0;border-radius:6px;padding:5px 12px;cursor:pointer;color:#fff;background:#444;font-size:11px'
-        globalTestBtn.addEventListener('click', async () => {
-            if (globalTestRunning) return
-            globalTestRunning = true
-            globalTestBtn.textContent = '⏳ 正在测速...'
-            globalTestBtn.disabled = true
-            globalSpeedBox.style.display = 'block'
-
-            // 每个地区抽最多 3 个代表节点（优先不同 ISP）
-            const pickRepNodes = (regionName) => {
-                let nodes = (cdnDataCache && cdnDataCache[regionName]) || (EMBEDDED.cdn && EMBEDDED.cdn[regionName]) || []
-                nodes = nodes.filter(n => getNodeFailCount(n) < 1)  // 跳过拉黑节点
-                if (nodes.length === 0) return []
-                const ispSet = new Set()
-                const picked = []
-                // 第一轮：每种 ISP 各取第一个
-                for (const n of nodes) {
-                    const isp = detectIsp(n)
-                    if (!ispSet.has(isp)) {
-                        ispSet.add(isp)
-                        picked.push(n)
-                        if (picked.length >= 3) break
-                    }
-                }
-                // 不够 3 个就补
-                for (const n of nodes) {
-                    if (picked.length >= 3) break
-                    if (!picked.includes(n)) picked.push(n)
-                }
-                return picked
-            }
-
-            const allRegions = regionList.filter(r => r !== manualRegionName)
-            const allNodes = []
-            allRegions.forEach(region => {
-                const reps = pickRepNodes(region)
-                reps.forEach(n => allNodes.push({ region, node: n }))
-            })
-
-            globalSpeedBox.innerHTML = `<div style="color:#888;padding:4px">🌐 测试 ${allRegions.length} 个地区共 ${allNodes.length} 个节点...</div>`
-
-            const results = await runSpeedTest(allNodes.map(x => x.node), (done, total, last) => {
-                globalSpeedBox.innerHTML = `<div style="color:#888;padding:4px">🌐 测速中 ${done}/${total} — ${last.node.split('.')[0]} ${last.error ? '❌' : last.latency + 'ms'}</div>`
-            })
-
-            // 按地区分组，取每地区最快
-            const regionBest = {}
-            allNodes.forEach(({ region, node }) => {
-                const lat = speedTestCache[node]
-                if (lat !== undefined && lat > 0) {
-                    if (!regionBest[region] || lat < regionBest[region].latency) {
-                        regionBest[region] = { region, node, latency: lat }
-                    }
-                }
-            })
-
-            const sortedRegions = Object.values(regionBest).sort((a, b) => a.latency - b.latency)
-
-            // 渲染结果
-            globalSpeedBox.innerHTML = '<div style="color:#aaa;font-weight:700;padding:4px;border-bottom:1px solid #333;margin-bottom:4px">📊 各区域最快节点（点击跳转）</div>'
-            sortedRegions.forEach((item, i) => {
-                const c = latencyColor(item.latency, false)
-                const isp = detectIsp(item.node)
-                const row = document.createElement('div')
-                row.style.cssText = 'display:flex;align-items:center;gap:6px;padding:3px 4px;cursor:pointer;border-radius:4px'
-                row.innerHTML = `<span style="color:#888;font-size:10px;min-width:20px">#${i + 1}</span>` +
-                    `<span style="color:${c};font-weight:700;min-width:42px;text-align:right">${item.latency}ms</span>` +
-                    `<span style="color:#888;font-size:10px;min-width:28px">[${isp}]</span>` +
-                    `<span style="font-weight:600;min-width:36px;color:#ddd">${item.region}</span>` +
-                    `<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#888">${item.node.split('.')[0]}</span>`
-                row.addEventListener('mouseenter', () => { row.style.background = '#333' })
-                row.addEventListener('mouseleave', () => { row.style.background = 'transparent' })
-                row.addEventListener('click', () => {
-                    // 设置为该地区+节点
-                    setRegion('main', item.region)
-                    setTargetCdnNode('main', item.node)
-                    setRegion('live', item.region)
-                    setTargetCdnNode('live', item.node)
-                    setRegion('diagnostics', item.region)
-                    setTargetCdnNode('diagnostics', item.node)
-                    // 关闭面板再打开以刷新
-                    root.remove()
-                    openPanel()
-                })
-                globalSpeedBox.appendChild(row)
-            })
-
-            globalTestRunning = false
-            globalTestBtn.textContent = '🌐 重测全部'
-            globalTestBtn.disabled = false
-        })
-        globalRow.appendChild(globalTestBtn)
-        body.appendChild(globalRow)
-        // ====== END 全局测速 ======
-
-        const mountRegionAndNode = async (ctx, hostBox) => {
-            const region = getRegion(ctx)
-            let nodeValue = getTargetCdnNode(ctx)
-            let speedTesting = false
-            let nodeList = []
-
-            const { row: regionRow } = mkRow('地区')
-            const regionSelect = mkSelect(regionList, region)
-            regionRow.appendChild(regionSelect)
-            hostBox.appendChild(regionRow)
-
-            // 节点选择行
-            const { row: nodeRow } = mkRow('节点')
-            hostBox.appendChild(nodeRow)
-
-            // 测速按钮 + 摘要行 + 实时结果
-            const speedBtnRow = document.createElement('div')
-            speedBtnRow.style.cssText = 'display:flex;align-items:center;gap:8px;margin:4px 0'
-            hostBox.appendChild(speedBtnRow)
-
-            const liveResultBox = document.createElement('div')
-            liveResultBox.style.cssText = 'display:none;margin:2px 0 6px;max-height:120px;overflow-y:auto;font-size:10px'
-            hostBox.appendChild(liveResultBox)
-
-            const clearAll = () => {
-                while (nodeRow.childNodes.length > 1) nodeRow.removeChild(nodeRow.lastChild)
-                speedBtnRow.innerHTML = ''
-                liveResultBox.style.display = 'none'
-                liveResultBox.innerHTML = ''
-            }
-
-            // 刷新下拉框选项（不重建整个控件，只更新 option 的 text）
-            const refreshSelectOptions = () => {
-                const sel = nodeRow.querySelector('select')
-                if (!sel) return
-                const currentValue = sel.value
-                sel.innerHTML = nodeList.map(v => {
-                    if (v === defaultCdnNode) return `<option value="${v}">${v}</option>`
-                    const isp = detectIsp(v)
-                    const cached = speedTestCache[v]
-                    const cacheStr = cached !== undefined ? (cached < 0 ? ' ❌' : ` ${cached}ms`) : ''
-                    const hasContent = contentOkCache[v]
-                    const contentMark = hasContent === true ? ' ✅' : (hasContent === false ? ' 🚫' : '')
-                    const fc = getNodeFailCount(v)
-                    const failMark = fc > 0 ? ` ×${fc}` : ''
-                    const tag = `[${isp}]${cacheStr}${contentMark}${failMark} `
-                    return `<option value="${v}">${tag}${v}</option>`
-                }).join('')
-                sel.value = currentValue
-            }
-
-            const selectNode = (name) => {
-                nodeValue = name
-                setTargetCdnNode(ctx, nodeValue)
-                const sel = nodeRow.querySelector('select')
-                if (sel) sel.value = name
-                // 显示/隐藏拉黑按钮
-                const bb = speedBtnRow.querySelector('.ccb-ban-btn')
-                if (bb) bb.style.display = (name && name !== defaultCdnNode) ? '' : 'none'
-            }
-
-            const renderNodeControl = async (regionValue) => {
-                clearAll()
-
+        let adopted = null
+        for (const [ctx, title] of [['main', '视频 / 课堂 / 番剧'], ['live', '直播（原生下载）'], ['diagnostics', 'B站测速页']]) {
+            const section = el('fieldset', undefined, root)
+            section.style.cssText = 'border:1px solid #444;margin:12px 0;padding:10px'
+            el('legend', title, section)
+            const listBox = el('div', undefined, section)
+            const carrier = select(section, ['全部', '电信', '联通', '移动', '其他'], getIspFilter(), v => { setIspFilter(v); renderNodes(region.value) })
+            const region = select(section, ['推荐镜像', ...regionList], getRegion(ctx), v => { setRegion(ctx, v); renderNodes(v) })
+            const results = el('pre', undefined, section)
+            results.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere;max-height:160px;overflow:auto;font-size:11px'
+            let nodes = []
+            const renderNodes = regionValue => {
+                listBox.replaceChildren()
+                const saved = getTargetCdnNode(ctx)
                 if (regionValue === manualRegionName) {
-                    const inp = mkInput(nodeValue === defaultCdnNode ? '' : nodeValue)
-                    nodeRow.appendChild(inp)
-                    inp.addEventListener('input', () => {
-                        const v = inp.value.trim()
-                        nodeValue = v ? v : defaultCdnNode
-                        setTargetCdnNode(ctx, nodeValue)
+                    const input = el('input', undefined, listBox)
+                    input.style.cssText = 'width:95%;background:#222;color:white;padding:7px'
+                    input.value = saved === defaultCdnNode ? '' : saved
+                    input.placeholder = '输入 bilivideo CDN 域名'
+                    button('保存自定义', listBox, () => {
+                        const value = input.value.trim()
+                        if (!value) setTargetCdnNode(ctx, defaultCdnNode)
+                        else {
+                            try {
+                                const u = new URL(value.includes('://') ? value : `https://${value}`)
+                                if (u.protocol !== 'https:' || !/(?:^|\.)bilivideo\.(?:com|cn|net)$/.test(u.hostname) || u.port || u.username || u.password || u.search || u.hash || u.pathname !== '/') throw new Error()
+                                setTargetCdnNode(ctx, u.hostname)
+                            } catch (_) { results.textContent = '请输入有效的 HTTPS bilivideo CDN 域名'; return }
+                        }
+                        results.textContent = '已保存首选'; updateStatus()
                     })
-                    return
+                    nodes = []; return
                 }
-
-                nodeList = await getCdnListByRegion(regionValue)
-                if (!nodeList.includes(nodeValue)) nodeValue = defaultCdnNode
-                setTargetCdnNode(ctx, nodeValue)
-
-                // 节点下拉（独占整行）
-                const sel = document.createElement('select')
-                sel.style.cssText = 'flex:1;background:#111;color:#fff;border:1px solid #333;border-radius:8px;padding:8px'
-                sel.innerHTML = nodeList.map(v => {
-                    if (v === defaultCdnNode) return `<option value="${v}">${v}</option>`
-                    const isp = detectIsp(v)
-                    const cached = speedTestCache[v]
-                    const cacheStr = cached !== undefined ? (cached < 0 ? ' ❌' : ` ${cached}ms`) : ''
-                    const hasContent = contentOkCache[v]
-                    const contentMark = hasContent === true ? ' ✅' : (hasContent === false ? ' 🚫' : '')
-                    const fc = getNodeFailCount(v)
-                    const failMark = fc > 0 ? ` ×${fc}` : ''
-                    const tag = `[${isp}]${cacheStr}${contentMark}${failMark} `
-                    return `<option value="${v}">${tag}${v}</option>`
-                }).join('')
-                sel.value = nodeValue
-                nodeRow.appendChild(sel)
-                sel.addEventListener('change', () => { selectNode(sel.value) })
-
-                // ---- 测速按钮 + 摘要 ----
-                const testNodes = nodeList.filter(n => n !== defaultCdnNode)
-
-                const testBtn = document.createElement('button')
-                testBtn.textContent = speedTesting ? '⏳ 测速中...' : '⚡ 测速'
-                testBtn.title = '测试所有节点延迟，自动选最快'
-                testBtn.style.cssText = 'border:0;border-radius:6px;padding:5px 12px;cursor:pointer;color:#fff;background:#555;font-size:11px;white-space:nowrap'
-                testBtn.disabled = speedTesting
-                speedBtnRow.appendChild(testBtn)
-
-                // 摘要文字
-                const summaryLabel = document.createElement('span')
-                summaryLabel.style.cssText = 'font-size:11px;color:#888;flex:1'
-                speedBtnRow.appendChild(summaryLabel)
-
-                // 🚫 拉黑按钮：播放失败时手动标记当前节点
-                const banBtn = document.createElement('button')
-                banBtn.textContent = '🚫'
-                banBtn.title = '当前节点播放失败？点击标记，下次测速自动跳过'
-                banBtn.className = 'ccb-ban-btn'
-                banBtn.style.cssText = 'display:none;border:0;border-radius:4px;padding:2px 6px;cursor:pointer;color:#fff;background:#600;font-size:11px'
-                banBtn.addEventListener('click', async () => {
-                    const cur = getTargetCdnNode(ctx)
-                    if (cur === defaultCdnNode) return
-                    addFailCount(cur)
-                    const fc = getNodeFailCount(cur)
-                    summaryLabel.innerHTML = `<span style="color:#f60">🚫 已标记 ${cur.split('.')[0]} (×${fc})，已从列表移除</span>`
-                    banBtn.style.display = 'none'
-                    // 刷新所有三栏的下拉框，移除拉黑节点
-                    ispRefreshCallbacks.forEach(fn => { try { fn() } catch (_) {} })
+                nodes = regionValue === '推荐镜像' ? [...Core.MIRRORS] : [...((cdnDataCache || {})[regionValue] || [])]
+                if (carrier.value !== '全部') nodes = nodes.filter(n => detectIsp(n) === carrier.value)
+                nodes = nodes.filter(n => !getNodeFailCount(n))
+                const s = select(listBox, [defaultCdnNode, ...nodes], saved, v => { setTargetCdnNode(ctx, v); updateStatus() })
+                for (const o of s.options) {
+                    if (o.value === defaultCdnNode) continue
+                    const service = /mirrorali/.test(o.value) ? '阿里云' : /mirrorcos/.test(o.value) ? '腾讯云' : /mirrorhw|mirror08/.test(o.value) ? '华为云' : detectIsp(o.value)
+                    o.textContent = `${service} · ${o.value}${nodes.includes(o.value) ? '' : '（已保存，当前列表未收录）'}`
+                }
+            }
+            renderNodes(region.value)
+            if (ctx !== 'live') {
+                const test = button('验证与测速当前视频', section, async () => {
+                    const r = engine.first()
+                    if (!r) { results.textContent = '尚未取得当前视频地址，请先打开视频。无视频时不会把连接延迟标成内容可用。'; return }
+                    test.disabled = true; adopted = null
+                    const ctrl = new AbortController(), measurements = []
+                    results.textContent = '验证中：每节点最多 64 KiB；通过后每节点测速最多 1 MiB。'
+                    try {
+                        // 手动测试也限制候选数，避免扫描数百节点消耗大量流量。
+                        const chosen = nodes.slice(0, 6)
+                        for (let i = 0; i < chosen.length; i += 3) await Promise.all(chosen.slice(i, i + 3).map(async node => {
+                            const url = Core.swap(r.originals.find(Core.ordinary) || '', node)
+                            if (!url) { measurements.push({ node, hasContent: null }); return }
+                            const verified = await engine.probe(r, url, ctrl.signal)
+                            const speed = verified.hasContent === true ? await engine.probe(r, url, ctrl.signal, 1048576) : verified
+                            measurements.push({ node, ...speed })
+                            results.textContent = measurements.map(x => `${x.hasContent === true ? '✅ 有效分片' : x.hasContent === false ? '🚫 不可用' : '❔ 未知'} ${x.node} ${x.bps ? (x.bps / 1048576).toFixed(2) + ' MiB/s' : ''}`).join('\n')
+                        }))
+                        const best = measurements.filter(x => x.hasContent === true).sort((a, b) => b.bps - a.bps)[0]
+                        if (best) { adopted = { ctx, node: best.node }; results.textContent += `\n推荐：${best.node}，点击「采用推荐」保存。` }
+                    } catch (e) { results.textContent = `测速结束：${e.message}` }
+                    finally { test.disabled = false }
                 })
-                speedBtnRow.appendChild(banBtn)
-                // 初始显示状态
-                if (nodeValue !== defaultCdnNode && regionValue !== manualRegionName) {
-                    banBtn.style.display = ''
-                }
-
-                testBtn.addEventListener('click', async () => {
-                    if (speedTesting) return
-                    speedTesting = true
-                    testBtn.textContent = '⏳ 测速中...'
-                    testBtn.disabled = true
-                    summaryLabel.textContent = ''
-
-                    // 实时结果收集
-                    const liveResults = []
-                    liveResultBox.style.display = 'block'
-                    liveResultBox.innerHTML = ''
-
-                    const updateLiveDisplay = () => {
-                        // 显示最近 8 个结果，按延迟排序
-                        const show = [...liveResults].sort((a, b) => {
-                            if (a.error !== b.error) return a.error ? 1 : -1
-                            return a.latency - b.latency
-                        }).slice(0, 8)
-                        liveResultBox.innerHTML = show.map(r => {
-                            const c = latencyColor(r.latency, r.error)
-                            const ms = r.error ? '超时' : r.latency + 'ms'
-                            const name = r.node.split('.')[0]
-                            return `<span style="display:inline-block;margin:1px 4px;padding:1px 6px;border-radius:3px;background:#222;color:${c}">${ms} ${name}</span>`
-                        }).join('')
-                    }
-
-                    // 第 1 步：连接延迟测试
-                    await runSpeedTest(testNodes, (done, total, last) => {
-                        liveResults.push(last)
-                        summaryLabel.textContent = `⚡ ${done}/${total}`
-                        if (done % 3 === 0 || done === total) updateLiveDisplay()
-                    })
-                    updateLiveDisplay()
-
-                    // 排序
-                    const sorted = testNodes.map(n => ({
-                        node: n,
-                        latency: speedTestCache[n] !== undefined ? speedTestCache[n] : -1,
-                        error: (speedTestCache[n] !== undefined ? speedTestCache[n] : -1) < 0,
-                        hasContent: null
-                    })).sort((a, b) => {
-                        if (a.error !== b.error) return a.error ? 1 : -1
-                        return a.latency - b.latency
-                    })
-
-                    // 第 2 步：内容验活
-                    await collectProbePath()  // 主动采集 + API 兜底，确保有探针 URL
-                    if (videoProbePath && videoProbePath.path) {
-                        summaryLabel.textContent = '🔍 验活...'
-                        const probeResults = await probeTopNodes(sorted, Math.min(20, sorted.length), (done, total, last) => {
-                            summaryLabel.textContent = `🔍 验活 ${done}/${total}`
-                        })
-                        const probeMap = {}
-                        probeResults.forEach(p => { probeMap[p.node] = p.hasContent })
-                        sorted.forEach(s => {
-                            if (probeMap[s.node] !== undefined) {
-                                s.hasContent = probeMap[s.node]
-                            } else {
-                                s.hasContent = false  // 超出验活范围的视为未确认
-                            }
-                        })
-                    }
-
-                    // 选最优
-                    const rankNode = (r) => {
-                        if (r.error) return 99
-                        if (getNodeFailCount(r.node) >= 1) return 98
-                        if (r.hasContent === true) return 1
-                        if (r.hasContent === null) return 2
-                        return 3
-                    }
-                    const best = sorted.reduce((a, b) => {
-                        const ra = rankNode(a), rb = rankNode(b)
-                        if (ra !== rb) return ra < rb ? a : b
-                        return a.latency < b.latency ? a : b
-                    }, sorted[0])
-
-                    if (best && rankNode(best) < 98) {
-                        selectNode(best.node)
-                        const fc = getNodeFailCount(best.node)
-                        const contentTag = best.hasContent === true
-                            ? '<span style="color:#0f0">✅ 节点可达</span>'
-                            : (best.hasContent === false
-                                ? '<span style="color:#f60">⚠️ 节点不通</span>'
-                                : '<span style="color:#888" title="在视频播放页测速可验连通性">未验活</span>')
-                        const failTag = fc > 0 ? `<span style="color:#f60"> 🚫×${fc}</span>` : ''
-                        summaryLabel.innerHTML = `<span style="color:#0f0">✅ 已选:</span> <span style="color:#fff">${best.latency}ms</span> ${contentTag}${failTag} <span style="color:#888">${best.node.split('.')[0]}</span>`
-                    } else {
-                        summaryLabel.innerHTML = '<span style="color:#f60">❌ 所有节点不可用</span>'
-                    }
-
-                    // 测完同步下拉框：显示所有节点的延迟
-                    refreshSelectOptions()
-
-                    speedTesting = false
-                    testBtn.textContent = '⚡ 重测'
-                    testBtn.disabled = false
+                button('采用推荐', section, () => {
+                    if (adopted?.ctx !== ctx) { results.textContent = '请先验证当前视频，取得此栏的推荐结果。'; return }
+                    setTargetCdnNode(ctx, adopted.node); renderNodes(region.value); updateStatus()
                 })
             }
-
-            // 注册 ISP 筛选变化时的刷新回调
-            const refreshViaIsp = async () => {
-                await renderNodeControl(regionSelect.value)
-            }
-            ispRefreshCallbacks.push(refreshViaIsp)
-
-            await renderNodeControl(regionSelect.value)
-            regionSelect.addEventListener('change', async () => {
-                const next = regionSelect.value
-                setRegion(ctx, next)
-                await renderNodeControl(next)
+            button('手动拉黑首选', section, () => {
+                const node = getTargetCdnNode(ctx)
+                if (node === defaultCdnNode) return
+                addFailCount(node); renderNodes(region.value); results.textContent = '已加入手动黑名单；自动回退不会写入此名单。'
             })
         }
-
-        const mainBox = mkSectionBox()
-        mainBox.appendChild(mkSectionTitle('视频 | 课堂 | 番剧(需特殊设置)'))
-        body.appendChild(mainBox)
-        await mountRegionAndNode('main', mainBox)
-
-        const liveBox = mkSectionBox()
-        liveBox.appendChild(mkSectionTitle('直播'))
-        body.appendChild(liveBox)
-        await mountRegionAndNode('live', liveBox)
-
-        const diagnosticsBox = mkSectionBox()
-        diagnosticsBox.appendChild(mkSectionTitle('测速'))
-        body.appendChild(diagnosticsBox)
-        await mountRegionAndNode('diagnostics', diagnosticsBox)
-
-        const actions = document.createElement('div')
-        actions.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;margin-top:12px'
-        const powerBtn = createButton(getPowerMode() ? '强力替换模式：ON' : '强力替换模式：OFF', true, false)
-        powerBtn.addEventListener('click', () => {
-            const next = !getPowerMode()
-            GM_setValue(powerModeStored, next)
-            powerBtn.textContent = next ? '强力替换模式：ON' : '强力替换模式：OFF'
+        el('label', '点播多连接：', root)
+        const threadValue = settings.acceleration ? String(settings.threads) : '关闭'
+        select(root, ['关闭', 'auto', '2', '4', '6', '8'], threadValue, value => {
+            settings.acceleration = value !== '关闭'; settings.threads = value === '关闭' ? 'auto' : value; persistSettings()
         })
-        const liveBtn = createButton(getLiveMode() ? '适用直播和番剧：ON' : '适用直播和番剧：OFF', true, false)
-        liveBtn.addEventListener('click', () => {
-            const next = !getLiveMode()
-            GM_setValue(liveModeStored, next)
-            liveBtn.textContent = next ? '适用直播和番剧：ON' : '适用直播和番剧：OFF'
+        el('small', 'auto 从 4 连接开始，在 2–8 间调整；仅加速已验证的有限 DASH Range 请求。', root)
+        const audioLabel = el('label', undefined, root)
+        audioLabel.style.display = 'block'
+        const audio = el('input', undefined, audioLabel); audio.type = 'checkbox'; audio.checked = settings.audioOriginal
+        el('span', ' 音频使用原始备用地址', audioLabel)
+        audio.addEventListener('change', () => { settings.audioOriginal = audio.checked; persistSettings() })
+        button(getLiveMode() ? '直播换源：开启' : '直播换源：关闭', root, e => {
+            const next = !getLiveMode(); GM_setValue(liveModeStored, next); e.currentTarget.textContent = next ? '直播换源：开启' : '直播换源：关闭'
         })
-        const applyBtn = createButton('应用并刷新', false, true)
-        applyBtn.addEventListener('click', () => { location.reload() })
-        actions.appendChild(powerBtn)
-        actions.appendChild(liveBtn)
-        actions.appendChild(applyBtn)
-        body.appendChild(actions)
-
-        // 起播超时设置
-        const stuckRow = document.createElement('div')
-        stuckRow.style.cssText = 'display:flex;align-items:center;gap:8px;margin-top:10px;padding:8px;background:rgba(255,255,255,.04);border-radius:8px'
-        const stuckLabel = document.createElement('span')
-        stuckLabel.textContent = '⏱ 起播超时'
-        stuckLabel.style.cssText = 'color:#bbb;font-size:11px;white-space:nowrap'
-        const stuckInput = document.createElement('input')
-        stuckInput.type = 'number'
-        stuckInput.min = 1
-        stuckInput.max = 30
-        stuckInput.value = GM_getValue(STUCK_TIMEOUT_KEY, 3)
-        stuckInput.style.cssText = 'width:40px;background:#111;color:#fff;border:1px solid #333;border-radius:6px;padding:4px 6px;font-size:12px;text-align:center'
-        const stuckUnit = document.createElement('span')
-        stuckUnit.textContent = '秒'
-        stuckUnit.style.cssText = 'color:#888;font-size:11px'
-        const stuckHint = document.createElement('span')
-        stuckHint.textContent = '⚠ 设太低(<2s)可能误杀正常节点'
-        stuckHint.style.cssText = 'color:#f90;font-size:10px;flex:1'
-        stuckInput.addEventListener('change', () => {
-            let v = parseInt(stuckInput.value) || 3
-            if (v < 1) v = 1
-            stuckInput.value = v
-            GM_setValue(STUCK_TIMEOUT_KEY, v)
-            stuckHint.textContent = v < 2 ? '⚠ 极低！网络波动就可能误杀' : (v < 3 ? '⚠ 偏低，可能误杀' : '')
+        button('应用并刷新', root, () => location.reload())
+        const blacklist = el('pre', undefined, root)
+        blacklist.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px'
+        const showBans = () => { blacklist.textContent = `手动黑名单：${Object.keys(getFailCount()).join(', ') || '空'}\n旧版记录（未自动启用）：${GM_getValue('CCB_legacyBlacklist', '{}')}` }
+        showBans()
+        button('清空手动黑名单', root, () => { GM_setValue('CCB_manualBlacklist', '{}'); invalidateConfig(); showBans() })
+        button('恢复旧版黑名单', root, () => { GM_setValue('CCB_manualBlacklist', GM_getValue('CCB_legacyBlacklist', '{}')); invalidateConfig(); showBans() })
+        button('下载诊断记录', root, () => {
+            // 诊断只导出节点与状态，不导出签名、Cookie 或播放地址。
+            const blob = new Blob([JSON.stringify({ version: '2.3.0', preferred: getTargetCdnNode(), ...diagnostics }, null, 2)], { type: 'application/json' })
+            const a = el('a'); a.href = URL.createObjectURL(blob); a.download = 'ccb-diagnostics.json'; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000)
         })
-        stuckRow.appendChild(stuckLabel)
-        stuckRow.appendChild(stuckInput)
-        stuckRow.appendChild(stuckUnit)
-        stuckRow.appendChild(stuckHint)
-        body.appendChild(stuckRow)
-
-        // 黑名单管理
-        const banListBox = document.createElement('div')
-        banListBox.style.cssText = 'margin-top:8px;padding:8px;background:rgba(255,255,255,.04);border-radius:8px;display:none'
-
-        const renderBanList = () => {
-            banListBox.innerHTML = ''
-            const fc = getFailCount()
-            const entries = Object.entries(fc).filter(([,c]) => c >= 1).sort(([,a], [,b]) => b - a)
-            if (entries.length === 0) {
-                banListBox.innerHTML = '<div style="color:#888;font-size:11px;padding:4px">暂无拉黑节点</div>'
-            } else {
-                entries.forEach(([node, count]) => {
-                    const row = document.createElement('div')
-                    row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:2px 0;font-size:11px'
-                    const nameSpan = document.createElement('span')
-                    nameSpan.textContent = node.split('.')[0]
-                    nameSpan.style.cssText = 'color:#888;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1'
-                    const countSpan = document.createElement('span')
-                    countSpan.textContent = `×${count}`
-                    countSpan.style.cssText = 'color:#f66;margin:0 8px'
-                    const releaseBtn = document.createElement('button')
-                    releaseBtn.textContent = '放出'
-                    releaseBtn.style.cssText = 'border:0;border-radius:3px;padding:1px 6px;cursor:pointer;color:#0f0;background:#030;font-size:10px'
-                    releaseBtn.addEventListener('click', () => {
-                        const fc2 = getFailCount()
-                        delete fc2[node]
-                        GM_setValue(failCountStored, JSON.stringify(fc2))
-                        renderBanList()
-                        if (Object.keys(getFailCount()).length === 0) banListBox.style.display = 'none'
-                    })
-                    row.appendChild(nameSpan)
-                    row.appendChild(countSpan)
-                    row.appendChild(releaseBtn)
-                    banListBox.appendChild(row)
-                })
-            }
-            // 标题+清空按钮
-            const headerRow = document.createElement('div')
-            headerRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;border-bottom:1px solid #333;padding-bottom:4px'
-            headerRow.innerHTML = '<span style="color:#f66;font-size:11px;font-weight:700">🚫 黑名单</span>'
-            const clearBtn = document.createElement('button')
-            clearBtn.textContent = '清空全部'
-            clearBtn.style.cssText = 'border:0;border-radius:4px;padding:3px 8px;cursor:pointer;color:#fff;background:#600;font-size:10px'
-            clearBtn.addEventListener('click', () => {
-                GM_setValue(failCountStored, '{}')
-                banListBox.style.display = 'none'
-            })
-            headerRow.appendChild(clearBtn)
-            banListBox.insertBefore(headerRow, banListBox.firstChild)
-        }
-
-        const toggleBanBtn = document.createElement('button')
-        toggleBanBtn.textContent = '🚫 黑名单'
-        toggleBanBtn.style.cssText = 'border:0;border-radius:6px;padding:5px 10px;cursor:pointer;color:#f66;background:transparent;font-size:11px;margin-left:4px'
-        toggleBanBtn.addEventListener('click', () => {
-            if (banListBox.style.display === 'none') {
-                renderBanList()
-                banListBox.style.display = 'block'
-            } else {
-                banListBox.style.display = 'none'
-            }
-        })
-        actions.appendChild(toggleBanBtn)
-        body.appendChild(banListBox)
-
         document.documentElement.appendChild(root)
-    }
+        observer.observe(document.documentElement, { childList: true, subtree: true })
+    } finally { panelOpening = false }
+}
+
+// ===PANEL_END===
 
     if (window.top === window) {
-        const stripNodeSuffix = (s) => String(s).replace(/(?:\.bilivideo\.(?:com|cn)|\.edge\.mountaintoys\.cn)$/i, '')
-        const mainNodeName = stripNodeSuffix(getTargetCdnNode('main'))
-        const diagnosticsNodeName = stripNodeSuffix(getTargetCdnNode('diagnostics'))
-        const liveNodeName = stripNodeSuffix(getTargetCdnNode('live'))
-        GM_registerMenuCommand(`📺CCB (${mainNodeName} | ${liveNodeName} | ${diagnosticsNodeName})`, () => { openPanel() })
-        GM_registerMenuCommand('阅读文档 | 建议反馈 | 版本回退', () => { window.open('https://github.com/Kanda-Akihito-Kun/ccb') })
-
-        // ====== 自动故障转移：3s 未起播即判定失败 + 报错浮层兜底 ======
-        let failoverTriggered = false
-        const tryAutoFailover = (reason) => {
-            if (failoverTriggered) return
-            const ctx = isLiveContext() ? 'live' : (isDiagnosticsContext() ? 'diagnostics' : 'main')
-            const curNode = getTargetCdnNode(ctx)
-            if (curNode === defaultCdnNode) return
-            if (getRegion(ctx) === manualRegionName) return
-
-            failoverTriggered = true
-
-            // 标记当前节点失败
-            addFailCount(curNode)
-            const fc = getNodeFailCount(curNode)
-            logger(`🚫 自动拉黑 (${reason}): ${curNode.split('.')[0]} (×${fc})`)
-
-            // 找下一个可用节点
-            const curRegion = getRegion(ctx)
-            const allNodes = (cdnDataCache && cdnDataCache[curRegion]) || (EMBEDDED.cdn && EMBEDDED.cdn[curRegion]) || []
-            const candidates = allNodes.filter(n => {
-                if (n === curNode) return false
-                if (getNodeFailCount(n) >= 1) return false
-                return true
-            })
-            candidates.sort((a, b) => (speedTestCache[a] || 9999) - (speedTestCache[b] || 9999))
-
-            if (candidates.length > 0) {
-                const next = candidates[0]
-                logger(`🔄 自动切换: ${curNode.split('.')[0]} → ${next.split('.')[0]}`)
-                setTargetCdnNode(ctx, next)
-            } else {
-                logger('🔄 无可用节点，回退默认源')
-                setTargetCdnNode(ctx, defaultCdnNode)
-            }
-            setTimeout(() => { location.reload() }, 2000)
-        }
-
-        // ---- 机制 1：监听 <video> 元素，超时未起播即判定失败 ----
-        const getStuckTimeout = () => GM_getValue(STUCK_TIMEOUT_KEY, 3) * 1000  // 默认 3s
-        let videoWatchStarted = false
-
-        const isVideoPlaying = (v) => {
-            return v && !v.paused && v.readyState >= 2 && v.currentTime > 0
-        }
-
-        const checkVideoStuck = (video, startTime) => {
-            if (failoverTriggered) return
-            const timeout = getStuckTimeout()
-            const elapsed = Date.now() - startTime
-            if (elapsed < timeout) {
-                if (isVideoPlaying(video)) {
-                    logger('✅ 视频已起播，取消故障检测')
-                    return  // 起播成功，取消检测
-                }
-                // 还没到 3s，继续等待
-                setTimeout(() => checkVideoStuck(video, startTime), 500)
-                return
-            }
-            // 超过 3s 仍未起播
-            if (!isVideoPlaying(video)) {
-                logger(`⚠️ 视频 ${elapsed}ms 未起播 (readyState=${video.readyState}, paused=${video.paused}, currentTime=${video.currentTime})`)
-                tryAutoFailover('3s未起播')
-            }
-        }
-
-        const watchVideoElements = () => {
-            if (videoWatchStarted || failoverTriggered) return
-            // 只对主站视频页生效
-            if (location.host !== mainHost && location.host !== liveHost) return
-            if (!isCcbEnabled()) return
-
-            const videos = document.querySelectorAll('video')
-            for (const v of videos) {
-                if (v.src && v.src.indexOf(getReplacementHost()) !== -1) {
-                    videoWatchStarted = true
-                    logger('检测到 CDN 视频元素，启动 3s 起播检测')
-                    setTimeout(() => checkVideoStuck(v, Date.now()), 1000)  // 给播放器 1s 初始化
-                    return
-                }
-                // B站播放器可能用 blob URL，检查 src 是否包含 bilivideo
-                if (v.src && (v.src.indexOf('bilivideo') !== -1 || v.src.indexOf('akamaized') !== -1)) {
-                    videoWatchStarted = true
-                    logger('检测到视频元素，启动 3s 起播检测')
-                    setTimeout(() => checkVideoStuck(v, Date.now()), 1000)
-                    return
-                }
-            }
-        }
-
-        // 用 MutationObserver 监听 <video> 元素的出现
-        const videoObserver = new MutationObserver(() => {
-            watchVideoElements()
-            // 同时检查报错浮层
-            checkErrorOverlay()
-        })
-        try {
-            videoObserver.observe(document.documentElement, { childList: true, subtree: true })
-        } catch (_) {}
-
-        // 定时轮询兜底
-        const pollInterval = setInterval(() => {
-            watchVideoElements()
-            checkErrorOverlay()
-        }, 2000)
-
-        // ---- 机制 2：报错浮层兜底（错误码/网络异常提示） ----
-        const ERROR_SELECTORS = [
-            '.bilibili-player-video-error',
-            '.bpx-player-error-feedback',
-            '.bpx-player-error',
-            '[class*="player-error"]',
-        ]
-        const ERROR_TEXT_PATTERNS = /错误码|网络状况异常|视频加载失败|请求错误|4\d{3}|无法播放/i
-
-        const checkErrorOverlay = () => {
-            if (failoverTriggered) return
-            for (const sel of ERROR_SELECTORS) {
-                const el = document.querySelector(sel)
-                if (el && el.offsetParent !== null) {
-                    const text = el.textContent || ''
-                    if (ERROR_TEXT_PATTERNS.test(text)) {
-                        logger('检测到播放器报错:', text.substring(0, 80))
-                        tryAutoFailover('播放器报错')
-                        return
-                    }
-                }
-            }
-        }
-
-        // 页面加载后也检查一次
-        setTimeout(() => { watchVideoElements(); checkErrorOverlay() }, 2000)
-        // ====== END 自动故障转移 ======
+        GM_registerMenuCommand('📺 CCB 设置与播放诊断', openPanel)
+        GM_registerMenuCommand('CCB 使用说明与反馈', () => window.open('https://github.com/maxzrb/bilibiliccb'))
     }
-
-    logger('CCB 加载完成', { host: location.host, path: location.pathname })
+    document.addEventListener('seeking', () => engine.cancel(), true)
+    try {
+        const observer = new PerformanceObserver(list => {
+            for (const entry of list.getEntries()) {
+                if (!hasMediaDomain(entry.name) || !['video', 'xmlhttprequest', 'fetch'].includes(entry.initiatorType)) continue
+                // 原生请求的跨域计时可能不可读；只报告实际请求域名，不推算速度。
+                if (entry.initiatorType === 'video' || !mediaConfig().enabled) {
+                    diagnostics.events.push({ time: Date.now(), state: '原生播放器请求', node: new URL(entry.name).hostname, reason: '原生通道，速度未知' })
+                    if (diagnostics.events.length > 50) diagnostics.events.shift()
+                    document.dispatchEvent(new Event('ccb-status'))
+                }
+            }
+        })
+        observer.observe({ type: 'resource', buffered: true })
+    } catch (_) {}
+    const converge = () => {
+        settings = GM_getValue(SETTINGS_KEY, settings); invalidateConfig()
+    }
+    document.addEventListener('visibilitychange', converge)
+    window.addEventListener('pageshow', converge)
+    window.addEventListener('pagehide', () => engine.cancel())
+    logger('CCB 2.3.0 加载完成', { host: location.host, path: location.pathname })
 })()

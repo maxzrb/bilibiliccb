@@ -3,7 +3,7 @@
 // @description  Custom CDN of Bilibili (CCB)
 // @namespace    CCB
 // @license      MIT
-// @version      2.2.0
+// @version      2.3.0
 // @author       鼠鼠今天吃嘉然, AreithDream
 // @run-at       document-start
 // @match        https://www.bilibili.com/video/*
@@ -19,6 +19,11 @@
 // @connect      cdn.jsdelivr.net
 // @connect      raw.githubusercontent.com
 // @connect      api.bilibili.com
+// @connect      maxzrb.github.io
+// @connect      bilivideo.com
+// @connect      akamaized.net
+// @updateURL    https://raw.githubusercontent.com/maxzrb/bilibiliccb/main/script/ccb.bundle.user.js
+// @downloadURL  https://raw.githubusercontent.com/maxzrb/bilibiliccb/main/script/ccb.bundle.user.js
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -36,8 +41,23 @@
     };
     // ===EMBEDDED_END===
 
+    // ===CORE_START===
+    // 构建时嵌入选源内核与浏览器适配器。
+    // ===CORE_END===
+    const Core = globalThis.CcbCore
+    let regionList = ['手动输入']
+    let cdnDataCache = EMBEDDED.cdn
+    const nativeFetch = unsafeWindow.fetch.bind(unsafeWindow)
+    const diagnostics = { events: [], video: null, audio: null }
+    let lastPlayRequest = null
+    let playFingerprint = ''
+    const liveRoutes = new Map()
+
     // API 源列表，按优先级排列 — jsDelivr 国内可访问，GitHub Pages 作为备用
     const API_SOURCES = [
+        'https://cdn.jsdelivr.net/gh/maxzrb/bilibiliccb@main/data',
+        'https://raw.githubusercontent.com/maxzrb/bilibiliccb/main/data',
+        'https://maxzrb.github.io/bilibiliccb/api',
         'https://cdn.jsdelivr.net/gh/Kanda-Akihito-Kun/ccb@main/data',
         'https://raw.githubusercontent.com/Kanda-Akihito-Kun/ccb/main/data',
         'https://kanda-akihito-kun.github.io/ccb/api',
@@ -127,14 +147,19 @@
         ctx === 'live' ? liveRegionStored : (ctx === 'diagnostics' ? diagnosticsRegionStored : mainRegionStored),
         normalizeRegion(GM_getValue(oldRegionStored, manualRegionName)),
     ))
-    const setTargetCdnNode = (ctx, value) => GM_setValue(
-        ctx === 'live' ? liveCdnNodeStored : (ctx === 'diagnostics' ? diagnosticsCdnNodeStored : mainCdnNodeStored),
-        value,
-    )
-    const setRegion = (ctx, value) => GM_setValue(
-        ctx === 'live' ? liveRegionStored : (ctx === 'diagnostics' ? diagnosticsRegionStored : mainRegionStored),
-        value,
-    )
+    const setTargetCdnNode = (ctx, value) => {
+        GM_setValue(ctx === 'live' ? liveCdnNodeStored : (ctx === 'diagnostics' ? diagnosticsCdnNodeStored : mainCdnNodeStored), value)
+        settings.contexts = settings.contexts || {}
+        settings.contexts[ctx] = { node: value, region: getRegion(ctx) }
+        GM_setValue(SETTINGS_KEY, settings)
+        invalidateConfig(); engine.cancel()
+    }
+    const setRegion = (ctx, value) => {
+        GM_setValue(ctx === 'live' ? liveRegionStored : (ctx === 'diagnostics' ? diagnosticsRegionStored : mainRegionStored), value)
+        settings.contexts = settings.contexts || {}
+        settings.contexts[ctx] = { node: getTargetCdnNode(ctx), region: value }
+        GM_setValue(SETTINGS_KEY, settings)
+    }
     const getPowerMode = () => GM_getValue(powerModeStored, true)
     const getLiveMode = () => GM_getValue(liveModeStored, false)
     const isCcbEnabled = () => getTargetCdnNode() !== defaultCdnNode
@@ -203,24 +228,8 @@
 
     const IGNORE_HOST_RE = /^(?:bvc|data|pbp|api|api\w+)\./
 
-    const replaceMediaUrl = (s) => {
-        if (typeof s !== 'string') return s
-        if (!shouldApplyReplacement()) return s
-        if (!hasMediaDomain(s)) return s
-
-        try {
-            const u = new URL(s.startsWith('//') ? `https:${s}` : s)
-            if (IGNORE_HOST_RE.test(u.hostname)) return s
-        } catch (_) {
-            const m = s.match(/^https?:\/\/([\w.-]+)/) || s.match(/^\/\/([\w.-]+)/)
-            if (m && IGNORE_HOST_RE.test(m[1])) return s
-        }
-
-        if (s.startsWith('http://') || s.startsWith('https://')) return s.replace(/^https?:\/\/.*?\//, getReplacement())
-        if (s.startsWith('//')) return s.replace(/^\/\/.*?\//, getReplacement().replace(/^https?:/, ''))
-        if (/^[^/]+\//.test(s)) return s.replace(/^[^/]+\//, `${getReplacementHost()}/`)
-        return s
-    }
+    // 点播请求由内核处理，保留原始备用节点及签名。
+    const replaceMediaUrl = s => s
 
     const replaceMediaHostValue = (s) => {
         if (typeof s !== 'string') return s
@@ -241,166 +250,9 @@
         return s
     }
 
-    // 保存最近的真实视频分片路径，用于 CDN 内容验活
-    let videoProbePath = null  // { path: '/upgcxcode/...', host: 'cn-xxx.bilivideo.com' }
-
-    // 主动从页面全局变量中采集视频探针路径
-    const scanObjForMediaUrl = (obj, depth) => {
-        if (!obj || typeof obj !== 'object' || depth > 8 || videoProbePath) return
-        if (Array.isArray(obj)) {
-            for (const item of obj) scanObjForMediaUrl(item, depth + 1)
-            return
-        }
-        for (const k in obj) {
-            if (!Object.prototype.hasOwnProperty.call(obj, k)) continue
-            const v = obj[k]
-            if (typeof v === 'string' && hasMediaDomain(v)) {
-                const probe = extractVideoPath(v)
-                if (probe) { videoProbePath = probe; return }
-            } else if (typeof v === 'object') {
-                scanObjForMediaUrl(v, depth + 1)
-            }
-        }
-    }
-
-    const collectProbePath = async () => {
-        if (videoProbePath && videoProbePath.path) {
-            logger('验活: 已有探针路径', videoProbePath.path.substring(0, 60))
-            return
-        }
-
-        // 1. 扫页面全局变量
-        try { scanObjForMediaUrl(unsafeWindow.__playinfo__, 0) } catch (_) {}
-        if (videoProbePath) { logger('验活: 从 __playinfo__ 采到探针'); return }
-        try { scanObjForMediaUrl(unsafeWindow.__INITIAL_STATE__, 0) } catch (_) {}
-        if (videoProbePath) { logger('验活: 从 __INITIAL_STATE__ 采到探针'); return }
-
-        // 2. 检查是否在视频页
-        const pathname = location.pathname
-        const bvMatch = pathname.match(/\/video\/(BV[\w]+)/)
-        const epMatch = pathname.match(/\/bangumi\/play\/(ep\d+)/)
-        if (!bvMatch && !epMatch) {
-            logger('验活: 非视频页，跳过探针采集')
-            return
-        }
-
-        // 3. 提取 cid（尝试多种路径）
-        let cid = null
-        try {
-            const st = unsafeWindow.__INITIAL_STATE__
-            if (st) {
-                cid = st?.videoData?.cid || st?.cid || st?.epInfo?.cid || st?.mediaInfo?.param?.cid
-                // 也尝试从 videoData.pages 中找
-                if (!cid && st?.videoData?.pages) {
-                    const pages = st.videoData.pages
-                    if (Array.isArray(pages) && pages.length > 0) cid = pages[0].cid
-                }
-            }
-        } catch (_) {}
-        if (!cid) {
-            logger('验活: 未能提取 cid')
-            return
-        }
-        logger('验活: 提取到 cid=' + cid + '，请求 playurl API...')
-
-        // 4. 请求 playurl API（用 fetch，B站 API 支持 CORS）
-        const apiUrl = `https://api.bilibili.com/x/player/playurl?cid=${cid}&qn=0&fnval=4048&fourk=1`
-        try {
-            const resp = await fetch(apiUrl, { credentials: 'include' })
-            if (!resp.ok) { logger('验活: API 返回 ' + resp.status); return }
-            const data = await resp.json()
-            if (data.code !== 0) { logger('验活: API code=' + data.code); return }
-            scanObjForMediaUrl(data, 0)
-            if (videoProbePath) {
-                logger('验活: 从 API 采到探针', videoProbePath.path.substring(0, 60))
-            } else {
-                logger('验活: API 响应中未找到媒体 URL')
-            }
-        } catch (e) {
-            logger('验活: API 请求失败', e.message || e)
-        }
-    }
-
-    const extractVideoPath = (urlStr) => {
-        if (typeof urlStr !== 'string') return null
-        try {
-            const u = new URL(urlStr.startsWith('//') ? `https:${urlStr}` : urlStr)
-            // 提取路径+查询串（排除 host），用于拼到其他 CDN 节点上验证
-            if (u.pathname && u.pathname.length > 5) {
-                return { path: u.pathname + u.search, host: u.hostname }
-            }
-        } catch (_) {}
-        return null
-    }
-
-    const deepReplacePlayInfo = (obj) => {
-        if (!obj || typeof obj !== 'object') return
-        if (Array.isArray(obj)) {
-            for (let i = 0; i < obj.length; i++) {
-                const item = obj[i]
-                if (typeof item === 'string') {
-                    // 顺手采集视频探针路径
-                    if (!videoProbePath && hasMediaDomain(item)) {
-                        const probe = extractVideoPath(item)
-                        if (probe) videoProbePath = probe
-                    }
-                    const out = hasMediaDomain(item) ? replaceMediaUrl(item) : item
-                    if (out !== item) obj[i] = out
-                } else {
-                    deepReplacePlayInfo(item)
-                }
-            }
-            return
-        }
-        for (const k in obj) {
-            if (!Object.prototype.hasOwnProperty.call(obj, k)) continue
-            const v = obj[k]
-            if (typeof v === 'string') {
-                if (!videoProbePath && hasMediaDomain(v)) {
-                    const probe = extractVideoPath(v)
-                    if (probe) videoProbePath = probe
-                }
-                if (k === 'host') {
-                    if (hasMediaDomain(v)) obj[k] = replaceMediaHostValue(v)
-                } else {
-                    if (hasMediaDomain(v)) obj[k] = replaceMediaUrl(v)
-                }
-            } else if (Array.isArray(v) && k === 'backup_url') {
-                // 强力模式: 保留 backup_url 多样性，只用其他节点替换部分条目
-                // 不再全部替换为同一 CDN，避免单点故障导致视频加载失败
-                if (!getPowerMode()) continue
-                const regionNodes = getRegionCdnNodes(getRegion())
-                for (let i = 0; i < v.length; i++) {
-                    const s = v[i]
-                    if (typeof s === 'string') {
-                        if (hasMediaDomain(s)) {
-                            // 第 0 个 backup 用首选 CDN，其余用同地区不同节点做容灾
-                            if (i === 0) {
-                                v[i] = replaceMediaUrl(s)
-                            } else if (regionNodes.length > 0) {
-                                const altNode = regionNodes[i % regionNodes.length]
-                                const altUrl = 'https://' + altNode + '/'
-                                if (s.startsWith('http://') || s.startsWith('https://')) {
-                                    v[i] = s.replace(/^https?:\/\/.*?\//, altUrl)
-                                } else if (s.startsWith('//')) {
-                                    v[i] = s.replace(/^\/\/.*?\//, altUrl.replace(/^https?:/, ''))
-                                }
-                            }
-                        }
-                    }
-                    else deepReplacePlayInfo(s)
-                }
-            } else if (typeof v === 'object') {
-                deepReplacePlayInfo(v)
-            }
-        }
-    }
-
-    const transformPlayUrlResponse = (playInfo) => {
-        if (!playInfo || typeof playInfo !== 'object') return
-        if (playInfo.code !== (void 0) && playInfo.code !== 0) return
-        deepReplacePlayInfo(playInfo)
-    }
+    // ===INTEGRATION_START===
+    // 构建时嵌入配置、媒体登记和请求通道。
+    // ===INTEGRATION_END===
 
     const transformLiveNeptune = (obj) => {
         if (!obj || typeof obj !== 'object') return
@@ -429,7 +281,15 @@
                     if (!Array.isArray(infos)) continue
                     for (let ii = 0; ii < infos.length; ii++) {
                         const info = infos[ii]
-                        if (info && typeof info.host === 'string') info.host = replaceMediaHostValue(info.host)
+                        if (ii === 0 && info && typeof info.host === 'string') {
+                            const originalHost = info.host
+                            const replacementHost = replaceMediaHostValue(originalHost)
+                            if (replacementHost !== originalHost) {
+                                if (!infos.some(x => x !== info && x.host === originalHost)) infos.splice(1, 0, { ...info })
+                                if (c.base_url) liveRoutes.set(replacementHost + c.base_url + (info.extra || ''), originalHost + c.base_url + (info.extra || ''))
+                                info.host = replacementHost
+                            }
+                        }
                     }
                 }
             }
@@ -437,96 +297,8 @@
     }
 
     const replaceBilivideoInText = (text) => {
-        if (!shouldApplyReplacement()) return text
-        if (typeof text !== 'string') return text
-        if (text.indexOf('bilivideo.') === -1
-            && text.indexOf('acgvideo.') === -1
-            && text.indexOf('edge.mountaintoys.cn') === -1
-            && text.indexOf('akamaized.net') === -1
-        ) return text
-        const out = text.replace(/https?:\/\/[^"'\s]*?\.(?:(?:bilivideo|acgvideo)\.(?:com|cn)|edge\.mountaintoys\.cn|akamaized\.net)\//g, getReplacement())
-        const host = getReplacementHost()
-        if (!host) return out
-        return out.replace(/\b[\w.-]+\.(?:(?:bilivideo|acgvideo)\.(?:com|cn)|edge\.mountaintoys\.cn|akamaized\.net)\b/g, host)
-    }
-
-    const installCcbWorkerRuntime = (cfg) => {
-        const forceReplace = !!(cfg && cfg.forceReplace)
-        const shouldApply = () => forceReplace
-        const Replacement = (cfg && typeof cfg.replacement === 'string') ? cfg.replacement : ''
-        const replacementHost = (cfg && typeof cfg.replacementHost === 'string') ? cfg.replacementHost : ''
-        const getHost = () => replacementHost
-        const IgnoreHostRe = /^(?:bvc|data|pbp|api|api\w+)\./
-        const hasMedia = (s) => typeof s === 'string' && (
-            s.indexOf('bilivideo.') !== -1
-            || s.indexOf('acgvideo.') !== -1
-            || s.indexOf('edge.mountaintoys.cn') !== -1
-            || s.indexOf('akamaized.net') !== -1
-        )
-
-        const replaceUrl = (s) => {
-            if (typeof s !== 'string') return s
-            if (!shouldApply()) return s
-            if (!hasMedia(s)) return s
-            try {
-                const u = new URL(s.startsWith('//') ? `https:${s}` : s)
-                if (IgnoreHostRe.test(u.hostname)) return s
-            } catch (_) {
-                const m = s.match(/^https?:\/\/([\w.-]+)/) || s.match(/^\/\/([\w.-]+)/)
-                if (m && IgnoreHostRe.test(m[1])) return s
-            }
-            if (s.startsWith('http://') || s.startsWith('https://')) return s.replace(/^https?:\/\/.*?\//, Replacement)
-            if (s.startsWith('//')) return s.replace(/^\/\/.*?\//, Replacement.replace(/^https?:/, ''))
-            if (/^[^/]+\//.test(s)) return s.replace(/^[^/]+\//, `${getHost()}/`)
-            return s
-        }
-
-        const Ofetch = self.fetch
-        if (Ofetch) {
-            self.fetch = (input, init) => {
-                try {
-                    const s = typeof input === 'string' ? input : (input && input.url)
-                    if (typeof s === 'string') {
-                        const r = replaceUrl(s)
-                        if (r !== s) {
-                            if (typeof input === 'string') input = r
-                            else {
-                                const Req = self.Request || Request
-                                if (Req) input = new Req(r, input)
-                            }
-                        }
-                    }
-                } catch (_) {}
-                return Ofetch(input, init)
-            }
-        }
-
-        if (self.XMLHttpRequest) {
-            const OX = self.XMLHttpRequest
-            class X extends OX {
-                open(...args) {
-                    try {
-                        if (typeof args[1] === 'string') args[1] = replaceUrl(args[1])
-                    } catch (_) {}
-                    return super.open(...args)
-                }
-            }
-            self.XMLHttpRequest = X
-        }
-    }
-
-    const buildWorkerPrelude = () => {
-        const cfg = {
-            forceReplace: shouldApplyReplacement(),
-            replacement: getReplacement(),
-            replacementHost: getReplacementHost(),
-        }
-        const runtime = `(${installCcbWorkerRuntime.toString()})(${JSON.stringify(cfg)});`
-        return `(() => {\n` +
-            `  if (self.__CCB_WORKER_PRELUDE__) return;\n` +
-            `  self.__CCB_WORKER_PRELUDE__ = true;\n` +
-            `  try { ${runtime} } catch (_) {}\n` +
-            `})();\n`
+        // 无法识别的直播文本不整体替换，保留原生签名及故障转移信息。
+        return text
     }
 
     const interceptNetResponse = (theWindow => {
@@ -544,9 +316,12 @@
                 const hooked = w.__CCB_NET_HOOKED__
                 if (hooked && hooked.xhr === w.XMLHttpRequest && hooked.fetch === w.fetch) return true
 
-                const OX = w.XMLHttpRequest
+                const OX = Core.xhrAdapter(w.XMLHttpRequest, (url, init) => engine.route(url, init))
                 class XHR extends OX {
                     open(...args) {
+                        this._ccbMemo = null
+                        const requestUrl = String(args[1])
+                        this.addEventListener('load', () => { if (!this._ccb) noteNative(requestUrl, this.responseURL) }, { once: true })
                         try {
                             if (typeof args[1] === 'string') args[1] = replaceMediaUrl(args[1])
                         } catch (_) {}
@@ -554,38 +329,54 @@
                     }
                     get responseText() {
                         if (this.readyState !== this.DONE) return super.responseText
-                        return handle(super.responseText, this.responseURL, { type: 'xhr', xhr: this })
+                        const original = super.responseText
+                        if (this._ccbMemo && this._ccbMemo.original === original) return this._ccbMemo.value
+                        const value = handle(original, this.responseURL, { type: 'xhr', xhr: this })
+                        this._ccbMemo = { original, value }
+                        return value
                     }
                     get response() {
                         if (this.readyState !== this.DONE) return super.response
+                        if (this.responseType === '' || this.responseType === 'text') return this.responseText
                         return handle(super.response, this.responseURL, { type: 'xhr', xhr: this })
                     }
                 }
                 w.XMLHttpRequest = XHR
 
-                const Ofetch = w.fetch
-                w.fetch = (input, init) => {
-                    const s0 = typeof input === 'string' ? input : (input && input.url)
-                    if (typeof s0 === 'string') {
-                        const r = replaceMediaUrl(s0)
-                        if (r !== s0) {
-                            if (typeof input === 'string') input = r
-                            else input = new (w.Request || Request)(r, input)
-                        }
+                const Ofetch = w.fetch.bind(w)
+                w.fetch = async (input, init) => {
+                    const request = new (w.Request || Request)(input, init)
+                    const media = await engine.route(request.url, { method: request.method, headers: request.headers, signal: request.signal })
+                    if (media) return media
+                    const url = request.url
+                    const shouldIntercept = handle(null, url, { type: 'fetch', input, init })
+                    let resp, liveRetried = false
+                    try { resp = await Ofetch(request) }
+                    catch (error) {
+                        if (!liveRoutes.has(url) || request.signal.aborted) throw error
+                        liveRetried = true
+                        resp = await Ofetch(new (w.Request || Request)(liveRoutes.get(url), request))
                     }
-
-                    const s = typeof input === 'string' ? input : (input && input.url)
-                    let resolvedUrl = s
-                    try { resolvedUrl = new URL(s, w.location && w.location.href ? w.location.href : location.href).href } catch (_) {}
-
-                    const shouldIntercept = handle(null, resolvedUrl, { type: 'fetch', input, init })
-                    if (!shouldIntercept) return Ofetch(input, init)
-                    return Ofetch(input, init).then(resp => new Promise((resolve) => {
-                        resp.text().then(text => {
-                            const out = handle(text, resolvedUrl, { type: 'fetch', input, init, response: resp })
-                            resolve(new (w.Response || Response)(out, { status: resp.status, statusText: resp.statusText, headers: resp.headers }))
-                        })
-                    }))
+                    noteNative(url, resp.url)
+                    if (liveRoutes.has(url)) {
+                        if (!resp.ok && !liveRetried) {
+                            resp.body?.cancel().catch(() => {})
+                            resp = await Ofetch(new (w.Request || Request)(liveRoutes.get(url), request))
+                        }
+                        diagnostics.events.push({ time: Date.now(), kind: 'live', node: new URL(resp.url || url).hostname,
+                            state: '直播原生下载', reason: resp.url !== url ? '原始备用源或重定向' : '所选直播源' })
+                        if (diagnostics.events.length > 50) diagnostics.events.shift()
+                        document.dispatchEvent(new Event('ccb-status'))
+                    }
+                    if (!shouldIntercept) return resp
+                    if (!resp.body || [204, 205, 304].includes(resp.status)) return resp
+                    const text = await resp.text()
+                    const out = handle(text, url, { type: 'fetch', input, init, response: resp })
+                    const headers = new Headers(resp.headers)
+                    headers.delete('content-length'); headers.delete('content-encoding')
+                    const response = new (w.Response || Response)(out, { status: resp.status, statusText: resp.statusText, headers })
+                    Object.defineProperty(response, 'url', { value: resp.url })
+                    return response
                 }
 
                 try {
@@ -603,6 +394,8 @@
 
                             return new OBlob(parts, options)
                         }
+                        w.Blob.prototype = OBlob.prototype
+                        Object.setPrototypeOf(w.Blob, OBlob)
                         w.__CCB_BLOB_HOOKED__ = w.Blob
                     }
                 } catch (_) {}
@@ -615,18 +408,22 @@
                             try {
                                 if (!shouldInstallWorkerHooks()) return new OWorker(scriptURL, options)
                                 const raw = (typeof scriptURL === 'string') ? scriptURL : String(scriptURL)
-                                if (raw.startsWith('blob:') || raw.startsWith('data:')) return new OWorker(scriptURL, options)
+                                if (raw.startsWith('blob:') || raw.startsWith('data:')) return ccbAttachWorker(new OWorker(scriptURL, options), workerChannel, engine, noteNative)
                                 const isModule = options && options.type === 'module'
                                 const wrapperCode = isModule
                                     ? `${buildWorkerPrelude()}\nimport ${JSON.stringify(raw)};\n`
                                     : `${buildWorkerPrelude()}\nimportScripts(${JSON.stringify(raw)});\n`
                                 const blob = new w.Blob([wrapperCode], { type: 'application/javascript' })
                                 const url = w.URL.createObjectURL(blob)
-                                return new OWorker(url, options)
+                                const worker = ccbAttachWorker(new OWorker(url, options), workerChannel, engine, noteNative)
+                                setTimeout(() => w.URL.revokeObjectURL(url), 60000)
+                                return worker
                             } catch (_) {
                                 return new OWorker(scriptURL, options)
                             }
                         }
+                        w.Worker.prototype = OWorker.prototype
+                        Object.setPrototypeOf(w.Worker, OWorker)
                         w.__CCB_WORKER_WRAPPED__ = w.Worker
                     }
                 } catch (_) {}
@@ -658,6 +455,7 @@
         const u = typeof url === 'string' ? url : (url && url.url) || String(url)
         if (!PLAYURL_PATHS.some(p => u.includes(p))) return
         if (response === null) return true
+        lastPlayRequest = u
 
         try {
             if (typeof response === 'string') {
@@ -768,8 +566,6 @@
         return btn
     }
 
-    let regionList = [manualRegionName]
-    let cdnDataCache = null
 
     const requestText = (url) => new Promise((resolve, reject) => {
         const fetchFallback = () => fetch(url).then(r => r.text()).then(resolve, reject)
@@ -810,11 +606,15 @@
                     requestJson(`${src}/region.json`),
                     requestJson(`${src}/cdn.json`),
                 ])
+                if (!Array.isArray(regions) || !regions.every(v => typeof v === 'string')
+                    || !cdn || typeof cdn !== 'object' || Array.isArray(cdn)
+                    || !Object.values(cdn).every(v => Array.isArray(v) && v.every(n => typeof n === 'string' && /^[\w.-]+$/.test(n)))) throw new Error('节点数据结构错误')
                 if (Array.isArray(regions) && regions.length > 0) {
                     regionList = [manualRegionName, ...regions.filter(v => v && v !== manualRegionName && v !== '编辑')]
                 }
                 if (cdn && typeof cdn === 'object' && Object.keys(cdn).length > 0) {
                     cdnDataCache = cdn
+                    GM_setValue('CCB_data_v1', { regions, cdn, time: Date.now() }); invalidateConfig()
                 }
                 logger('在线更新数据成功，来源:', src)
                 return true
@@ -823,6 +623,17 @@
         logger('所有在线源不可用，使用内嵌数据')
         return false
     }
+
+    setTimeout(tryOnlineUpdate, 5000)
+    try {
+        const cached = GM_getValue('CCB_data_v1', null)
+        if (cached && Date.now() - cached.time >= 0 && Date.now() - cached.time < 7 * 86400000
+            && Array.isArray(cached.regions) && cached.regions.every(x => typeof x === 'string')
+            && cached.cdn && Object.values(cached.cdn).every(v => Array.isArray(v)
+                && v.every(n => typeof n === 'string' && /^[\w.-]+$/.test(n)))) {
+            regionList = [manualRegionName, ...cached.regions]; cdnDataCache = cached.cdn; invalidateConfig()
+        }
+    } catch (_) {}
 
     const getRegionList = async () => {
         // 已有数据直接返回，后台静默更新
@@ -850,877 +661,34 @@
         return [defaultCdnNode, ...sortByIsp(filtered, isp !== '全部' ? isp : null)]
     }
 
-    // ====== CDN 节点测速 ======
-    const speedTestCache = {}  // { nodeName: latency_ms }
-
-    // 单节点延迟测试：用 no-cors fetch 测 TCP+TLS 连接延迟，3s 超时
-    const testNodeLatency = (nodeName) => new Promise((resolve) => {
-        const url = `https://${nodeName}/`
-        const start = performance.now()
-        const ctrl = new AbortController()
-        const timer = setTimeout(() => { ctrl.abort(); resolve({ node: nodeName, latency: 3000, error: true }) }, 3000)
-        fetch(url, {
-            mode: 'no-cors',
-            cache: 'no-store',
-            credentials: 'omit',
-            signal: ctrl.signal,
-        }).then(() => {
-            clearTimeout(timer)
-            resolve({ node: nodeName, latency: Math.round(performance.now() - start), error: false })
-        }).catch((e) => {
-            clearTimeout(timer)
-            // 连接拒绝/网络错误也算失败，但仍记录耗时
-            resolve({ node: nodeName, latency: Math.round(performance.now() - start), error: true })
-        })
-    })
-
-    // 批量测速，并发上限 6，返回按延迟排序的结果
-    const runSpeedTest = async (nodes, onProgress) => {
-        const results = []
-        const CONCURRENCY = 6
-        const queue = [...nodes]
-
-        const worker = async () => {
-            while (queue.length > 0) {
-                const node = queue.shift()
-                const r = await testNodeLatency(node)
-                results.push(r)
-                if (onProgress) onProgress(results.length, nodes.length, r)
-            }
-        }
-
-        const workers = Array.from({ length: Math.min(CONCURRENCY, nodes.length) }, () => worker())
-        await Promise.all(workers)
-
-        // 排序：成功在前按延迟升序，失败排最后
-        results.sort((a, b) => {
-            if (a.error !== b.error) return a.error ? 1 : -1
-            return a.latency - b.latency
-        })
-        // 更新缓存
-        results.forEach(r => { speedTestCache[r.node] = r.error ? -1 : r.latency })
-        return results
-    }
-
-    // 节点失败计数（持久化到 GM storage），用于自动降权
-    const failCountStored = 'CCB_failCount'
-    const getFailCount = () => { try { return JSON.parse(GM_getValue(failCountStored, '{}')) } catch (_) { return {} } }
-    const addFailCount = (nodeName) => {
-        const fc = getFailCount()
-        fc[nodeName] = (fc[nodeName] || 0) + 1
-        GM_setValue(failCountStored, JSON.stringify(fc))
-    }
-    const getNodeFailCount = (nodeName) => { const fc = getFailCount(); return fc[nodeName] || 0 }
-
-    // 内容验活：用真实视频分片发 GET + Range 请求较大数据块 (8KB)
-    // no-cors 模式下看不到状态码，用传输耗时做启发式判断：
-    //   - 耗时 > 100ms：大概率有真实数据传输 → 有内容
-    // B站视频 URL 带节点绑定签名，换 host 后必然 403，所以验活改为测节点通用连通性：
-    // 去签名后发 HEAD 请求到视频路径，能响应（即使 403）说明节点在线且路径可路由
-    const contentOkCache = {}  // { nodeName: true/false/null }
-    const probeNodeContent = (nodeName) => new Promise((resolve) => {
-        if (!videoProbePath || !videoProbePath.path) {
-            return resolve({ node: nodeName, hasContent: null })
-        }
-        if (contentOkCache[nodeName] !== undefined) {
-            return resolve({ node: nodeName, hasContent: contentOkCache[nodeName] })
-        }
-        if (getNodeFailCount(nodeName) >= 1) {
-            contentOkCache[nodeName] = false
-            return resolve({ node: nodeName, hasContent: false })
-        }
-
-        // 去掉查询串（含节点绑定签名），只保留路径，避免 403 干扰判断
-        const cleanPath = videoProbePath.path.split('?')[0]
-        const url = `https://${nodeName}${cleanPath}`
-        const ctrl = new AbortController()
-        const timer = setTimeout(() => { ctrl.abort(); contentOkCache[nodeName] = false; resolve({ node: nodeName, hasContent: false }) }, 5000)
-        const t0 = performance.now()
-
-        fetch(url, {
-            method: 'HEAD',
-            mode: 'no-cors',
-            cache: 'no-store',
-            credentials: 'omit',
-            signal: ctrl.signal,
-        }).then(() => {
-            clearTimeout(timer)
-            const elapsed = performance.now() - t0
-            // 节点能响应（即使 403/404 也说明在线且路由正确），超时才是真死
-            const ok = elapsed < 4000  // 能连上就算 OK
-            contentOkCache[nodeName] = ok
-            resolve({ node: nodeName, hasContent: ok, latency: Math.round(elapsed) })
-        }).catch(() => {
-            clearTimeout(timer)
-            // fetch 失败（网络不可达），不是 CORS 错（no-cors 不会抛 CORS）
-            contentOkCache[nodeName] = false
-            resolve({ node: nodeName, hasContent: false })
-        })
-    })
-
-    // 对已测速结果中的前 N 个做内容验活
-    const probeTopNodes = async (speedResults, topN, onProbeProgress) => {
-        const candidates = speedResults.filter(r => !r.error).slice(0, topN)
-        if (candidates.length === 0) return []
-        const nodes = candidates.map(r => r.node)
-        const probeResults = []
-        const CONCURRENCY = 4
-        const queue = [...nodes]
-        const worker = async () => {
-            while (queue.length > 0) {
-                const node = queue.shift()
-                const pr = await probeNodeContent(node)
-                probeResults.push(pr)
-                if (onProbeProgress) onProbeProgress(probeResults.length, nodes.length, pr)
-            }
-        }
-        await Promise.all(Array.from({ length: Math.min(CONCURRENCY, nodes.length) }, () => worker()))
-        return probeResults
-    }
-
-    // 延迟着色
-    const latencyColor = (ms, error) => {
-        if (error) return '#666'
-        if (ms < 80) return '#0f0'
-        if (ms < 200) return '#ff0'
-        return '#f60'
-    }
-    // ====== END CDN 测速 ======
-
-    const openPanel = async () => {
-        const existing = document.querySelector('#ccb-settings-panel')
-        if (existing) {
-            existing.remove()
-            return
-        }
-
-        await getRegionList()
-
-        const root = document.createElement('div')
-        root.id = 'ccb-settings-panel'
-        root.style.cssText = [
-            'position:fixed',
-            'z-index:2147483647',
-            'right:18px',
-            'top:18px',
-            'width:460px',
-            'max-width:calc(100vw - 36px)',
-            'max-height:calc(100vh - 36px)',
-            'overflow:auto',
-            'background:rgba(20,20,20,.96)',
-            'border:1px solid #333',
-            'border-radius:10px',
-            'box-shadow:0 8px 24px rgba(0,0,0,.35)',
-            'color:#fff',
-            'font-size:12px',
-            'font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,"PingFang SC","Microsoft YaHei",sans-serif',
-        ].join(';')
-
-        const header = document.createElement('div')
-        header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px;border-bottom:1px solid #2f2f2f'
-        const title = document.createElement('div')
-        title.textContent = 'CCB 设置'
-        title.style.cssText = 'font-weight:700;font-size:13px'
-        const closeBtn = createButton('关闭', false, false)
-        closeBtn.addEventListener('click', () => { try { root.remove() } catch (_) {} })
-        header.appendChild(title)
-        header.appendChild(closeBtn)
-        root.appendChild(header)
-
-        const body = document.createElement('div')
-        body.style.cssText = 'padding:12px'
-        root.appendChild(body)
-
-        const mkRow = (labelText) => {
-            const row = document.createElement('div')
-            row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:10px;margin:10px 0'
-            const label = document.createElement('div')
-            label.textContent = labelText
-            label.style.cssText = 'color:#bbb'
-            row.appendChild(label)
-            return { row, label }
-        }
-
-        const mkSectionTitle = (text) => {
-            const t = document.createElement('div')
-            t.textContent = text
-            t.style.cssText = 'font-weight:700;font-size:12px;margin:2px 0 8px;color:#e5e5e5'
-            return t
-        }
-
-        const mkSectionBox = () => {
-            const box = document.createElement('div')
-            box.style.cssText = 'border:1px solid #2f2f2f;border-radius:10px;padding:10px;margin:10px 0;background:rgba(0,0,0,.12)'
-            return box
-        }
-
-        const mkSelect = (options, value) => {
-            const sel = document.createElement('select')
-            sel.style.cssText = 'flex:1;background:#111;color:#fff;border:1px solid #333;border-radius:8px;padding:8px'
-            sel.innerHTML = options.map(v => `<option value="${v}">${v}</option>`).join('')
-            sel.value = value
-            return sel
-        }
-
-        const mkInput = (value) => {
-            const inp = document.createElement('input')
-            inp.type = 'text'
-            inp.placeholder = '输入节点域名或URL'
-            inp.style.cssText = 'flex:1;background:#111;color:#fff;border:1px solid #333;border-radius:8px;padding:8px;outline:none'
-            inp.value = value || ''
-            return inp
-        }
-
-        // ====== 全局 ISP 筛选 ======
-        const ispRefreshCallbacks = []
-        const currentIspFilter = getIspFilter()
-        const ispOptions = ['全部', '电信', '联通', '移动', '其他']
-        const { row: ispFilterRow } = mkRow('运营商筛选')
-        const ispSelect = mkSelect(ispOptions, currentIspFilter)
-        ispSelect.title = '根据 CDN 节点名称中的运营商标记 (ct/cu/cm) 筛选'
-        ispSelect.addEventListener('change', () => {
-            setIspFilter(ispSelect.value)
-            ispRefreshCallbacks.forEach(fn => { try { fn() } catch (_) {} })
-        })
-        ispFilterRow.appendChild(ispSelect)
-        body.appendChild(ispFilterRow)
-
-        // 分隔线
-        const divider = document.createElement('div')
-        divider.style.cssText = 'border-top:1px solid #2f2f2f;margin:8px 0'
-        body.appendChild(divider)
-        // ====== END 全局 ISP 筛选 ======
-
-        // ====== 全局测速 ======
-        let globalTestRunning = false
-        const globalSpeedBox = document.createElement('div')
-        globalSpeedBox.style.cssText = 'display:none;margin:6px 0;max-height:300px;overflow-y:auto;font-size:11px;border:1px solid #333;border-radius:8px;padding:6px'
-        body.appendChild(globalSpeedBox)
-
-        const { row: globalRow } = mkRow('全局测速')
-        const globalTestBtn = document.createElement('button')
-        globalTestBtn.textContent = '🌐 测试全部地区'
-        globalTestBtn.title = '每个地区抽代表节点，测速后按地区排序'
-        globalTestBtn.style.cssText = 'border:0;border-radius:6px;padding:5px 12px;cursor:pointer;color:#fff;background:#444;font-size:11px'
-        globalTestBtn.addEventListener('click', async () => {
-            if (globalTestRunning) return
-            globalTestRunning = true
-            globalTestBtn.textContent = '⏳ 正在测速...'
-            globalTestBtn.disabled = true
-            globalSpeedBox.style.display = 'block'
-
-            // 每个地区抽最多 3 个代表节点（优先不同 ISP）
-            const pickRepNodes = (regionName) => {
-                let nodes = (cdnDataCache && cdnDataCache[regionName]) || (EMBEDDED.cdn && EMBEDDED.cdn[regionName]) || []
-                nodes = nodes.filter(n => getNodeFailCount(n) < 1)  // 跳过拉黑节点
-                if (nodes.length === 0) return []
-                const ispSet = new Set()
-                const picked = []
-                // 第一轮：每种 ISP 各取第一个
-                for (const n of nodes) {
-                    const isp = detectIsp(n)
-                    if (!ispSet.has(isp)) {
-                        ispSet.add(isp)
-                        picked.push(n)
-                        if (picked.length >= 3) break
-                    }
-                }
-                // 不够 3 个就补
-                for (const n of nodes) {
-                    if (picked.length >= 3) break
-                    if (!picked.includes(n)) picked.push(n)
-                }
-                return picked
-            }
-
-            const allRegions = regionList.filter(r => r !== manualRegionName)
-            const allNodes = []
-            allRegions.forEach(region => {
-                const reps = pickRepNodes(region)
-                reps.forEach(n => allNodes.push({ region, node: n }))
-            })
-
-            globalSpeedBox.innerHTML = `<div style="color:#888;padding:4px">🌐 测试 ${allRegions.length} 个地区共 ${allNodes.length} 个节点...</div>`
-
-            const results = await runSpeedTest(allNodes.map(x => x.node), (done, total, last) => {
-                globalSpeedBox.innerHTML = `<div style="color:#888;padding:4px">🌐 测速中 ${done}/${total} — ${last.node.split('.')[0]} ${last.error ? '❌' : last.latency + 'ms'}</div>`
-            })
-
-            // 按地区分组，取每地区最快
-            const regionBest = {}
-            allNodes.forEach(({ region, node }) => {
-                const lat = speedTestCache[node]
-                if (lat !== undefined && lat > 0) {
-                    if (!regionBest[region] || lat < regionBest[region].latency) {
-                        regionBest[region] = { region, node, latency: lat }
-                    }
-                }
-            })
-
-            const sortedRegions = Object.values(regionBest).sort((a, b) => a.latency - b.latency)
-
-            // 渲染结果
-            globalSpeedBox.innerHTML = '<div style="color:#aaa;font-weight:700;padding:4px;border-bottom:1px solid #333;margin-bottom:4px">📊 各区域最快节点（点击跳转）</div>'
-            sortedRegions.forEach((item, i) => {
-                const c = latencyColor(item.latency, false)
-                const isp = detectIsp(item.node)
-                const row = document.createElement('div')
-                row.style.cssText = 'display:flex;align-items:center;gap:6px;padding:3px 4px;cursor:pointer;border-radius:4px'
-                row.innerHTML = `<span style="color:#888;font-size:10px;min-width:20px">#${i + 1}</span>` +
-                    `<span style="color:${c};font-weight:700;min-width:42px;text-align:right">${item.latency}ms</span>` +
-                    `<span style="color:#888;font-size:10px;min-width:28px">[${isp}]</span>` +
-                    `<span style="font-weight:600;min-width:36px;color:#ddd">${item.region}</span>` +
-                    `<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#888">${item.node.split('.')[0]}</span>`
-                row.addEventListener('mouseenter', () => { row.style.background = '#333' })
-                row.addEventListener('mouseleave', () => { row.style.background = 'transparent' })
-                row.addEventListener('click', () => {
-                    // 设置为该地区+节点
-                    setRegion('main', item.region)
-                    setTargetCdnNode('main', item.node)
-                    setRegion('live', item.region)
-                    setTargetCdnNode('live', item.node)
-                    setRegion('diagnostics', item.region)
-                    setTargetCdnNode('diagnostics', item.node)
-                    // 关闭面板再打开以刷新
-                    root.remove()
-                    openPanel()
-                })
-                globalSpeedBox.appendChild(row)
-            })
-
-            globalTestRunning = false
-            globalTestBtn.textContent = '🌐 重测全部'
-            globalTestBtn.disabled = false
-        })
-        globalRow.appendChild(globalTestBtn)
-        body.appendChild(globalRow)
-        // ====== END 全局测速 ======
-
-        const mountRegionAndNode = async (ctx, hostBox) => {
-            const region = getRegion(ctx)
-            let nodeValue = getTargetCdnNode(ctx)
-            let speedTesting = false
-            let nodeList = []
-
-            const { row: regionRow } = mkRow('地区')
-            const regionSelect = mkSelect(regionList, region)
-            regionRow.appendChild(regionSelect)
-            hostBox.appendChild(regionRow)
-
-            // 节点选择行
-            const { row: nodeRow } = mkRow('节点')
-            hostBox.appendChild(nodeRow)
-
-            // 测速按钮 + 摘要行 + 实时结果
-            const speedBtnRow = document.createElement('div')
-            speedBtnRow.style.cssText = 'display:flex;align-items:center;gap:8px;margin:4px 0'
-            hostBox.appendChild(speedBtnRow)
-
-            const liveResultBox = document.createElement('div')
-            liveResultBox.style.cssText = 'display:none;margin:2px 0 6px;max-height:120px;overflow-y:auto;font-size:10px'
-            hostBox.appendChild(liveResultBox)
-
-            const clearAll = () => {
-                while (nodeRow.childNodes.length > 1) nodeRow.removeChild(nodeRow.lastChild)
-                speedBtnRow.innerHTML = ''
-                liveResultBox.style.display = 'none'
-                liveResultBox.innerHTML = ''
-            }
-
-            // 刷新下拉框选项（不重建整个控件，只更新 option 的 text）
-            const refreshSelectOptions = () => {
-                const sel = nodeRow.querySelector('select')
-                if (!sel) return
-                const currentValue = sel.value
-                sel.innerHTML = nodeList.map(v => {
-                    if (v === defaultCdnNode) return `<option value="${v}">${v}</option>`
-                    const isp = detectIsp(v)
-                    const cached = speedTestCache[v]
-                    const cacheStr = cached !== undefined ? (cached < 0 ? ' ❌' : ` ${cached}ms`) : ''
-                    const hasContent = contentOkCache[v]
-                    const contentMark = hasContent === true ? ' ✅' : (hasContent === false ? ' 🚫' : '')
-                    const fc = getNodeFailCount(v)
-                    const failMark = fc > 0 ? ` ×${fc}` : ''
-                    const tag = `[${isp}]${cacheStr}${contentMark}${failMark} `
-                    return `<option value="${v}">${tag}${v}</option>`
-                }).join('')
-                sel.value = currentValue
-            }
-
-            const selectNode = (name) => {
-                nodeValue = name
-                setTargetCdnNode(ctx, nodeValue)
-                const sel = nodeRow.querySelector('select')
-                if (sel) sel.value = name
-                // 显示/隐藏拉黑按钮
-                const bb = speedBtnRow.querySelector('.ccb-ban-btn')
-                if (bb) bb.style.display = (name && name !== defaultCdnNode) ? '' : 'none'
-            }
-
-            const renderNodeControl = async (regionValue) => {
-                clearAll()
-
-                if (regionValue === manualRegionName) {
-                    const inp = mkInput(nodeValue === defaultCdnNode ? '' : nodeValue)
-                    nodeRow.appendChild(inp)
-                    inp.addEventListener('input', () => {
-                        const v = inp.value.trim()
-                        nodeValue = v ? v : defaultCdnNode
-                        setTargetCdnNode(ctx, nodeValue)
-                    })
-                    return
-                }
-
-                nodeList = await getCdnListByRegion(regionValue)
-                if (!nodeList.includes(nodeValue)) nodeValue = defaultCdnNode
-                setTargetCdnNode(ctx, nodeValue)
-
-                // 节点下拉（独占整行）
-                const sel = document.createElement('select')
-                sel.style.cssText = 'flex:1;background:#111;color:#fff;border:1px solid #333;border-radius:8px;padding:8px'
-                sel.innerHTML = nodeList.map(v => {
-                    if (v === defaultCdnNode) return `<option value="${v}">${v}</option>`
-                    const isp = detectIsp(v)
-                    const cached = speedTestCache[v]
-                    const cacheStr = cached !== undefined ? (cached < 0 ? ' ❌' : ` ${cached}ms`) : ''
-                    const hasContent = contentOkCache[v]
-                    const contentMark = hasContent === true ? ' ✅' : (hasContent === false ? ' 🚫' : '')
-                    const fc = getNodeFailCount(v)
-                    const failMark = fc > 0 ? ` ×${fc}` : ''
-                    const tag = `[${isp}]${cacheStr}${contentMark}${failMark} `
-                    return `<option value="${v}">${tag}${v}</option>`
-                }).join('')
-                sel.value = nodeValue
-                nodeRow.appendChild(sel)
-                sel.addEventListener('change', () => { selectNode(sel.value) })
-
-                // ---- 测速按钮 + 摘要 ----
-                const testNodes = nodeList.filter(n => n !== defaultCdnNode)
-
-                const testBtn = document.createElement('button')
-                testBtn.textContent = speedTesting ? '⏳ 测速中...' : '⚡ 测速'
-                testBtn.title = '测试所有节点延迟，自动选最快'
-                testBtn.style.cssText = 'border:0;border-radius:6px;padding:5px 12px;cursor:pointer;color:#fff;background:#555;font-size:11px;white-space:nowrap'
-                testBtn.disabled = speedTesting
-                speedBtnRow.appendChild(testBtn)
-
-                // 摘要文字
-                const summaryLabel = document.createElement('span')
-                summaryLabel.style.cssText = 'font-size:11px;color:#888;flex:1'
-                speedBtnRow.appendChild(summaryLabel)
-
-                // 🚫 拉黑按钮：播放失败时手动标记当前节点
-                const banBtn = document.createElement('button')
-                banBtn.textContent = '🚫'
-                banBtn.title = '当前节点播放失败？点击标记，下次测速自动跳过'
-                banBtn.className = 'ccb-ban-btn'
-                banBtn.style.cssText = 'display:none;border:0;border-radius:4px;padding:2px 6px;cursor:pointer;color:#fff;background:#600;font-size:11px'
-                banBtn.addEventListener('click', async () => {
-                    const cur = getTargetCdnNode(ctx)
-                    if (cur === defaultCdnNode) return
-                    addFailCount(cur)
-                    const fc = getNodeFailCount(cur)
-                    summaryLabel.innerHTML = `<span style="color:#f60">🚫 已标记 ${cur.split('.')[0]} (×${fc})，已从列表移除</span>`
-                    banBtn.style.display = 'none'
-                    // 刷新所有三栏的下拉框，移除拉黑节点
-                    ispRefreshCallbacks.forEach(fn => { try { fn() } catch (_) {} })
-                })
-                speedBtnRow.appendChild(banBtn)
-                // 初始显示状态
-                if (nodeValue !== defaultCdnNode && regionValue !== manualRegionName) {
-                    banBtn.style.display = ''
-                }
-
-                testBtn.addEventListener('click', async () => {
-                    if (speedTesting) return
-                    speedTesting = true
-                    testBtn.textContent = '⏳ 测速中...'
-                    testBtn.disabled = true
-                    summaryLabel.textContent = ''
-
-                    // 实时结果收集
-                    const liveResults = []
-                    liveResultBox.style.display = 'block'
-                    liveResultBox.innerHTML = ''
-
-                    const updateLiveDisplay = () => {
-                        // 显示最近 8 个结果，按延迟排序
-                        const show = [...liveResults].sort((a, b) => {
-                            if (a.error !== b.error) return a.error ? 1 : -1
-                            return a.latency - b.latency
-                        }).slice(0, 8)
-                        liveResultBox.innerHTML = show.map(r => {
-                            const c = latencyColor(r.latency, r.error)
-                            const ms = r.error ? '超时' : r.latency + 'ms'
-                            const name = r.node.split('.')[0]
-                            return `<span style="display:inline-block;margin:1px 4px;padding:1px 6px;border-radius:3px;background:#222;color:${c}">${ms} ${name}</span>`
-                        }).join('')
-                    }
-
-                    // 第 1 步：连接延迟测试
-                    await runSpeedTest(testNodes, (done, total, last) => {
-                        liveResults.push(last)
-                        summaryLabel.textContent = `⚡ ${done}/${total}`
-                        if (done % 3 === 0 || done === total) updateLiveDisplay()
-                    })
-                    updateLiveDisplay()
-
-                    // 排序
-                    const sorted = testNodes.map(n => ({
-                        node: n,
-                        latency: speedTestCache[n] !== undefined ? speedTestCache[n] : -1,
-                        error: (speedTestCache[n] !== undefined ? speedTestCache[n] : -1) < 0,
-                        hasContent: null
-                    })).sort((a, b) => {
-                        if (a.error !== b.error) return a.error ? 1 : -1
-                        return a.latency - b.latency
-                    })
-
-                    // 第 2 步：内容验活
-                    await collectProbePath()  // 主动采集 + API 兜底，确保有探针 URL
-                    if (videoProbePath && videoProbePath.path) {
-                        summaryLabel.textContent = '🔍 验活...'
-                        const probeResults = await probeTopNodes(sorted, Math.min(20, sorted.length), (done, total, last) => {
-                            summaryLabel.textContent = `🔍 验活 ${done}/${total}`
-                        })
-                        const probeMap = {}
-                        probeResults.forEach(p => { probeMap[p.node] = p.hasContent })
-                        sorted.forEach(s => {
-                            if (probeMap[s.node] !== undefined) {
-                                s.hasContent = probeMap[s.node]
-                            } else {
-                                s.hasContent = false  // 超出验活范围的视为未确认
-                            }
-                        })
-                    }
-
-                    // 选最优
-                    const rankNode = (r) => {
-                        if (r.error) return 99
-                        if (getNodeFailCount(r.node) >= 1) return 98
-                        if (r.hasContent === true) return 1
-                        if (r.hasContent === null) return 2
-                        return 3
-                    }
-                    const best = sorted.reduce((a, b) => {
-                        const ra = rankNode(a), rb = rankNode(b)
-                        if (ra !== rb) return ra < rb ? a : b
-                        return a.latency < b.latency ? a : b
-                    }, sorted[0])
-
-                    if (best && rankNode(best) < 98) {
-                        selectNode(best.node)
-                        const fc = getNodeFailCount(best.node)
-                        const contentTag = best.hasContent === true
-                            ? '<span style="color:#0f0">✅ 节点可达</span>'
-                            : (best.hasContent === false
-                                ? '<span style="color:#f60">⚠️ 节点不通</span>'
-                                : '<span style="color:#888" title="在视频播放页测速可验连通性">未验活</span>')
-                        const failTag = fc > 0 ? `<span style="color:#f60"> 🚫×${fc}</span>` : ''
-                        summaryLabel.innerHTML = `<span style="color:#0f0">✅ 已选:</span> <span style="color:#fff">${best.latency}ms</span> ${contentTag}${failTag} <span style="color:#888">${best.node.split('.')[0]}</span>`
-                    } else {
-                        summaryLabel.innerHTML = '<span style="color:#f60">❌ 所有节点不可用</span>'
-                    }
-
-                    // 测完同步下拉框：显示所有节点的延迟
-                    refreshSelectOptions()
-
-                    speedTesting = false
-                    testBtn.textContent = '⚡ 重测'
-                    testBtn.disabled = false
-                })
-            }
-
-            // 注册 ISP 筛选变化时的刷新回调
-            const refreshViaIsp = async () => {
-                await renderNodeControl(regionSelect.value)
-            }
-            ispRefreshCallbacks.push(refreshViaIsp)
-
-            await renderNodeControl(regionSelect.value)
-            regionSelect.addEventListener('change', async () => {
-                const next = regionSelect.value
-                setRegion(ctx, next)
-                await renderNodeControl(next)
-            })
-        }
-
-        const mainBox = mkSectionBox()
-        mainBox.appendChild(mkSectionTitle('视频 | 课堂 | 番剧(需特殊设置)'))
-        body.appendChild(mainBox)
-        await mountRegionAndNode('main', mainBox)
-
-        const liveBox = mkSectionBox()
-        liveBox.appendChild(mkSectionTitle('直播'))
-        body.appendChild(liveBox)
-        await mountRegionAndNode('live', liveBox)
-
-        const diagnosticsBox = mkSectionBox()
-        diagnosticsBox.appendChild(mkSectionTitle('测速'))
-        body.appendChild(diagnosticsBox)
-        await mountRegionAndNode('diagnostics', diagnosticsBox)
-
-        const actions = document.createElement('div')
-        actions.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;margin-top:12px'
-        const powerBtn = createButton(getPowerMode() ? '强力替换模式：ON' : '强力替换模式：OFF', true, false)
-        powerBtn.addEventListener('click', () => {
-            const next = !getPowerMode()
-            GM_setValue(powerModeStored, next)
-            powerBtn.textContent = next ? '强力替换模式：ON' : '强力替换模式：OFF'
-        })
-        const liveBtn = createButton(getLiveMode() ? '适用直播和番剧：ON' : '适用直播和番剧：OFF', true, false)
-        liveBtn.addEventListener('click', () => {
-            const next = !getLiveMode()
-            GM_setValue(liveModeStored, next)
-            liveBtn.textContent = next ? '适用直播和番剧：ON' : '适用直播和番剧：OFF'
-        })
-        const applyBtn = createButton('应用并刷新', false, true)
-        applyBtn.addEventListener('click', () => { location.reload() })
-        actions.appendChild(powerBtn)
-        actions.appendChild(liveBtn)
-        actions.appendChild(applyBtn)
-        body.appendChild(actions)
-
-        // 起播超时设置
-        const stuckRow = document.createElement('div')
-        stuckRow.style.cssText = 'display:flex;align-items:center;gap:8px;margin-top:10px;padding:8px;background:rgba(255,255,255,.04);border-radius:8px'
-        const stuckLabel = document.createElement('span')
-        stuckLabel.textContent = '⏱ 起播超时'
-        stuckLabel.style.cssText = 'color:#bbb;font-size:11px;white-space:nowrap'
-        const stuckInput = document.createElement('input')
-        stuckInput.type = 'number'
-        stuckInput.min = 1
-        stuckInput.max = 30
-        stuckInput.value = GM_getValue(STUCK_TIMEOUT_KEY, 3)
-        stuckInput.style.cssText = 'width:40px;background:#111;color:#fff;border:1px solid #333;border-radius:6px;padding:4px 6px;font-size:12px;text-align:center'
-        const stuckUnit = document.createElement('span')
-        stuckUnit.textContent = '秒'
-        stuckUnit.style.cssText = 'color:#888;font-size:11px'
-        const stuckHint = document.createElement('span')
-        stuckHint.textContent = '⚠ 设太低(<2s)可能误杀正常节点'
-        stuckHint.style.cssText = 'color:#f90;font-size:10px;flex:1'
-        stuckInput.addEventListener('change', () => {
-            let v = parseInt(stuckInput.value) || 3
-            if (v < 1) v = 1
-            stuckInput.value = v
-            GM_setValue(STUCK_TIMEOUT_KEY, v)
-            stuckHint.textContent = v < 2 ? '⚠ 极低！网络波动就可能误杀' : (v < 3 ? '⚠ 偏低，可能误杀' : '')
-        })
-        stuckRow.appendChild(stuckLabel)
-        stuckRow.appendChild(stuckInput)
-        stuckRow.appendChild(stuckUnit)
-        stuckRow.appendChild(stuckHint)
-        body.appendChild(stuckRow)
-
-        // 黑名单管理
-        const banListBox = document.createElement('div')
-        banListBox.style.cssText = 'margin-top:8px;padding:8px;background:rgba(255,255,255,.04);border-radius:8px;display:none'
-
-        const renderBanList = () => {
-            banListBox.innerHTML = ''
-            const fc = getFailCount()
-            const entries = Object.entries(fc).filter(([,c]) => c >= 1).sort(([,a], [,b]) => b - a)
-            if (entries.length === 0) {
-                banListBox.innerHTML = '<div style="color:#888;font-size:11px;padding:4px">暂无拉黑节点</div>'
-            } else {
-                entries.forEach(([node, count]) => {
-                    const row = document.createElement('div')
-                    row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:2px 0;font-size:11px'
-                    const nameSpan = document.createElement('span')
-                    nameSpan.textContent = node.split('.')[0]
-                    nameSpan.style.cssText = 'color:#888;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1'
-                    const countSpan = document.createElement('span')
-                    countSpan.textContent = `×${count}`
-                    countSpan.style.cssText = 'color:#f66;margin:0 8px'
-                    const releaseBtn = document.createElement('button')
-                    releaseBtn.textContent = '放出'
-                    releaseBtn.style.cssText = 'border:0;border-radius:3px;padding:1px 6px;cursor:pointer;color:#0f0;background:#030;font-size:10px'
-                    releaseBtn.addEventListener('click', () => {
-                        const fc2 = getFailCount()
-                        delete fc2[node]
-                        GM_setValue(failCountStored, JSON.stringify(fc2))
-                        renderBanList()
-                        if (Object.keys(getFailCount()).length === 0) banListBox.style.display = 'none'
-                    })
-                    row.appendChild(nameSpan)
-                    row.appendChild(countSpan)
-                    row.appendChild(releaseBtn)
-                    banListBox.appendChild(row)
-                })
-            }
-            // 标题+清空按钮
-            const headerRow = document.createElement('div')
-            headerRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;border-bottom:1px solid #333;padding-bottom:4px'
-            headerRow.innerHTML = '<span style="color:#f66;font-size:11px;font-weight:700">🚫 黑名单</span>'
-            const clearBtn = document.createElement('button')
-            clearBtn.textContent = '清空全部'
-            clearBtn.style.cssText = 'border:0;border-radius:4px;padding:3px 8px;cursor:pointer;color:#fff;background:#600;font-size:10px'
-            clearBtn.addEventListener('click', () => {
-                GM_setValue(failCountStored, '{}')
-                banListBox.style.display = 'none'
-            })
-            headerRow.appendChild(clearBtn)
-            banListBox.insertBefore(headerRow, banListBox.firstChild)
-        }
-
-        const toggleBanBtn = document.createElement('button')
-        toggleBanBtn.textContent = '🚫 黑名单'
-        toggleBanBtn.style.cssText = 'border:0;border-radius:6px;padding:5px 10px;cursor:pointer;color:#f66;background:transparent;font-size:11px;margin-left:4px'
-        toggleBanBtn.addEventListener('click', () => {
-            if (banListBox.style.display === 'none') {
-                renderBanList()
-                banListBox.style.display = 'block'
-            } else {
-                banListBox.style.display = 'none'
-            }
-        })
-        actions.appendChild(toggleBanBtn)
-        body.appendChild(banListBox)
-
-        document.documentElement.appendChild(root)
-    }
+    // ===PANEL_START===
+    // 构建时嵌入设置与诊断面板。
+    // ===PANEL_END===
 
     if (window.top === window) {
-        const stripNodeSuffix = (s) => String(s).replace(/(?:\.bilivideo\.(?:com|cn)|\.edge\.mountaintoys\.cn)$/i, '')
-        const mainNodeName = stripNodeSuffix(getTargetCdnNode('main'))
-        const diagnosticsNodeName = stripNodeSuffix(getTargetCdnNode('diagnostics'))
-        const liveNodeName = stripNodeSuffix(getTargetCdnNode('live'))
-        GM_registerMenuCommand(`📺CCB (${mainNodeName} | ${liveNodeName} | ${diagnosticsNodeName})`, () => { openPanel() })
-        GM_registerMenuCommand('阅读文档 | 建议反馈 | 版本回退', () => { window.open('https://github.com/Kanda-Akihito-Kun/ccb') })
-
-        // ====== 自动故障转移：3s 未起播即判定失败 + 报错浮层兜底 ======
-        let failoverTriggered = false
-        const tryAutoFailover = (reason) => {
-            if (failoverTriggered) return
-            const ctx = isLiveContext() ? 'live' : (isDiagnosticsContext() ? 'diagnostics' : 'main')
-            const curNode = getTargetCdnNode(ctx)
-            if (curNode === defaultCdnNode) return
-            if (getRegion(ctx) === manualRegionName) return
-
-            failoverTriggered = true
-
-            // 标记当前节点失败
-            addFailCount(curNode)
-            const fc = getNodeFailCount(curNode)
-            logger(`🚫 自动拉黑 (${reason}): ${curNode.split('.')[0]} (×${fc})`)
-
-            // 找下一个可用节点
-            const curRegion = getRegion(ctx)
-            const allNodes = (cdnDataCache && cdnDataCache[curRegion]) || (EMBEDDED.cdn && EMBEDDED.cdn[curRegion]) || []
-            const candidates = allNodes.filter(n => {
-                if (n === curNode) return false
-                if (getNodeFailCount(n) >= 1) return false
-                return true
-            })
-            candidates.sort((a, b) => (speedTestCache[a] || 9999) - (speedTestCache[b] || 9999))
-
-            if (candidates.length > 0) {
-                const next = candidates[0]
-                logger(`🔄 自动切换: ${curNode.split('.')[0]} → ${next.split('.')[0]}`)
-                setTargetCdnNode(ctx, next)
-            } else {
-                logger('🔄 无可用节点，回退默认源')
-                setTargetCdnNode(ctx, defaultCdnNode)
-            }
-            setTimeout(() => { location.reload() }, 2000)
-        }
-
-        // ---- 机制 1：监听 <video> 元素，超时未起播即判定失败 ----
-        const getStuckTimeout = () => GM_getValue(STUCK_TIMEOUT_KEY, 3) * 1000  // 默认 3s
-        let videoWatchStarted = false
-
-        const isVideoPlaying = (v) => {
-            return v && !v.paused && v.readyState >= 2 && v.currentTime > 0
-        }
-
-        const checkVideoStuck = (video, startTime) => {
-            if (failoverTriggered) return
-            const timeout = getStuckTimeout()
-            const elapsed = Date.now() - startTime
-            if (elapsed < timeout) {
-                if (isVideoPlaying(video)) {
-                    logger('✅ 视频已起播，取消故障检测')
-                    return  // 起播成功，取消检测
-                }
-                // 还没到 3s，继续等待
-                setTimeout(() => checkVideoStuck(video, startTime), 500)
-                return
-            }
-            // 超过 3s 仍未起播
-            if (!isVideoPlaying(video)) {
-                logger(`⚠️ 视频 ${elapsed}ms 未起播 (readyState=${video.readyState}, paused=${video.paused}, currentTime=${video.currentTime})`)
-                tryAutoFailover('3s未起播')
-            }
-        }
-
-        const watchVideoElements = () => {
-            if (videoWatchStarted || failoverTriggered) return
-            // 只对主站视频页生效
-            if (location.host !== mainHost && location.host !== liveHost) return
-            if (!isCcbEnabled()) return
-
-            const videos = document.querySelectorAll('video')
-            for (const v of videos) {
-                if (v.src && v.src.indexOf(getReplacementHost()) !== -1) {
-                    videoWatchStarted = true
-                    logger('检测到 CDN 视频元素，启动 3s 起播检测')
-                    setTimeout(() => checkVideoStuck(v, Date.now()), 1000)  // 给播放器 1s 初始化
-                    return
-                }
-                // B站播放器可能用 blob URL，检查 src 是否包含 bilivideo
-                if (v.src && (v.src.indexOf('bilivideo') !== -1 || v.src.indexOf('akamaized') !== -1)) {
-                    videoWatchStarted = true
-                    logger('检测到视频元素，启动 3s 起播检测')
-                    setTimeout(() => checkVideoStuck(v, Date.now()), 1000)
-                    return
-                }
-            }
-        }
-
-        // 用 MutationObserver 监听 <video> 元素的出现
-        const videoObserver = new MutationObserver(() => {
-            watchVideoElements()
-            // 同时检查报错浮层
-            checkErrorOverlay()
-        })
-        try {
-            videoObserver.observe(document.documentElement, { childList: true, subtree: true })
-        } catch (_) {}
-
-        // 定时轮询兜底
-        const pollInterval = setInterval(() => {
-            watchVideoElements()
-            checkErrorOverlay()
-        }, 2000)
-
-        // ---- 机制 2：报错浮层兜底（错误码/网络异常提示） ----
-        const ERROR_SELECTORS = [
-            '.bilibili-player-video-error',
-            '.bpx-player-error-feedback',
-            '.bpx-player-error',
-            '[class*="player-error"]',
-        ]
-        const ERROR_TEXT_PATTERNS = /错误码|网络状况异常|视频加载失败|请求错误|4\d{3}|无法播放/i
-
-        const checkErrorOverlay = () => {
-            if (failoverTriggered) return
-            for (const sel of ERROR_SELECTORS) {
-                const el = document.querySelector(sel)
-                if (el && el.offsetParent !== null) {
-                    const text = el.textContent || ''
-                    if (ERROR_TEXT_PATTERNS.test(text)) {
-                        logger('检测到播放器报错:', text.substring(0, 80))
-                        tryAutoFailover('播放器报错')
-                        return
-                    }
-                }
-            }
-        }
-
-        // 页面加载后也检查一次
-        setTimeout(() => { watchVideoElements(); checkErrorOverlay() }, 2000)
-        // ====== END 自动故障转移 ======
+        GM_registerMenuCommand('📺 CCB 设置与播放诊断', openPanel)
+        GM_registerMenuCommand('CCB 使用说明与反馈', () => window.open('https://github.com/maxzrb/bilibiliccb'))
     }
-
-    logger('CCB 加载完成', { host: location.host, path: location.pathname })
+    document.addEventListener('seeking', () => engine.cancel(), true)
+    try {
+        const observer = new PerformanceObserver(list => {
+            for (const entry of list.getEntries()) {
+                if (!hasMediaDomain(entry.name) || !['video', 'xmlhttprequest', 'fetch'].includes(entry.initiatorType)) continue
+                // 原生请求的跨域计时可能不可读；只报告实际请求域名，不推算速度。
+                if (entry.initiatorType === 'video' || !mediaConfig().enabled) {
+                    diagnostics.events.push({ time: Date.now(), state: '原生播放器请求', node: new URL(entry.name).hostname, reason: '原生通道，速度未知' })
+                    if (diagnostics.events.length > 50) diagnostics.events.shift()
+                    document.dispatchEvent(new Event('ccb-status'))
+                }
+            }
+        })
+        observer.observe({ type: 'resource', buffered: true })
+    } catch (_) {}
+    const converge = () => {
+        settings = GM_getValue(SETTINGS_KEY, settings); invalidateConfig()
+    }
+    document.addEventListener('visibilitychange', converge)
+    window.addEventListener('pageshow', converge)
+    window.addEventListener('pagehide', () => engine.cancel())
+    logger('CCB 2.3.0 加载完成', { host: location.host, path: location.pathname })
 })()
