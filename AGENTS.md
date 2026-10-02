@@ -5,5 +5,5 @@
 - 会话启动先阅读 `docs/codex/STATUS.md`，检查 Git 状态及用户已有修改。
 - 项目状态以 `docs/codex/STATUS.md` 为准；阶段完成后更新该文件，并追加 `version/工作进度.md`。
 - 功能版本变化时追加 `version/版本迭代记录.md`，保留历史。
-- 修改 userscript 模块后执行 `python script/build.py`，通过 `--check` 确认 bundle 与源码、数据一致。
+- 修改 userscript 后执行 `python script/build.py`，检查 bundle 与源码、数据一致；回退后的构建器不支持 `--check`。
 - 验证命令与环境说明见 README；不得将受控浏览器测试描述为真实 CDN 全量播放验证。

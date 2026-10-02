@@ -1,79 +1,125 @@
-# Custom CDN of Bilibili（CCB）
+> 当前发布为 **2.3.1 回退版**：播放代码恢复到改动前的 2.2.0，版本号递增仅用于已安装 2.3.0 的自动更新。新版选源、多连接和面板已撤回。GitHub Actions 保持禁用，数据和脚本由本地手动维护。
+>
+> [安装回退版](https://github.com/maxzrb/bilibiliccb/releases/download/v2.3.1/ccb.bundle.user.js) · [原版 2.2.0](https://github.com/maxzrb/bilibiliccb/releases/download/v2.3.1/ccb-legacy-2.2.0.user.js)
 
-网页端哔哩哔哩选源与点播多连接加速用户脚本。当前版本：**2.3.0**。
+# Custom CDN of Bilibili (CCB) - 修改哔哩哔哩的网页视频、直播、番剧的播放源
 
-本项目是 [Kanda-Akihito-Kun/ccb](https://github.com/Kanda-Akihito-Kun/ccb) 的 Fork。
-原作者：鼠鼠今天吃嘉然；Fork 维护者：AreithDream（maxzrb）。
+> **这是 [原项目](https://github.com/Kanda-Akihito-Kun/ccb) 的 Fork 版本。**
+>
+> 原作者：[鼠鼠今天吃嘉然](https://space.bilibili.com/3220012)（[Kanda-Akihito-Kun](https://github.com/Kanda-Akihito-Kun)）
+> Fork 作者：AreithDream（[maxzrb](https://github.com/maxzrb)）
+>
+> **Fork 版主要改进见下方「Fork 更新」章节。**
 
-## 安装与使用
+## 项目介绍
 
-- [安装当前版本](https://raw.githubusercontent.com/maxzrb/bilibiliccb/main/script/ccb.bundle.user.js)
-- [回退到 2.2.0](https://raw.githubusercontent.com/maxzrb/bilibiliccb/main/script/ccb-legacy-2.2.0.user.js)
-- 主要验证环境：Edge/Chrome + Tampermonkey。用户脚本管理器需要允许脚本运行和媒体域名请求。
+**支持自定义切换 B 站的播放源地址。**
 
-安装后，从 Tampermonkey 菜单打开「📺 CCB 设置与播放诊断」。选择「推荐镜像」中的节点，或按地区、运营商筛选，或保存自定义 bilivideo 域名。新安装默认保留 B站原始源；已有首选与地区会迁移保留。
+**注意: 安装后请点击插件设置面板, 进行节点配置操作**
 
-选择深圳节点后，先使用首选及深圳候选。当前视频没有有效内容或持续过慢时，再临时扩展到原始备用地址。回退不会改写你的首选，下一个视频重新尝试首选池。域名中的 `sz`、`hz` 是标签，不保证节点的物理位置；面板分别显示首选与实际响应节点，服务端重定向也会记录。
+---
 
-「验证与测速当前视频」先读最多 64 KiB 验证分片，再对通过的节点读最多 1 MiB 测试吞吐；每次最多测试六个节点。测速只展示结果，点击「采用推荐」才改变首选。测速会产生少量额外流量。
+## Fork 更新 (v2.2.0)
 
-## 2.3.0 的主要变化
+相比原版 v2.0.2，本 Fork 做了以下改进：
 
-- 根据真实 GET 分片的状态、Content-Range 和字节长度验活。403/404、错误范围和不完整响应不再被误判为“有内容”；权限或网络原因无法读取时显示“未知”。
-- 区分普通 UPOS、特殊路径、M CDN 及音频，保留原始签名和备用地址；页面、XHR、Worker 共用同一选源状态。
-- 点播 DASH 有限 Range 请求支持多连接分块：自动模式从四连接开始，范围二到八连接；块大小 512 KiB，活动响应组装预算 16 MiB。超过预算的单个请求保留原生通道。
-- 同一资源只有在长度、样本及强 ETag 或相同签名路径验证兼容后才混用节点。分块范围和长度逐块检查，按顺序交付原生播放器。
-- 连续两个五秒下载窗口低于码率的 1.3 倍，且缓冲不足十秒，才因速度扩展回退池；至少三十秒内不重复进行速度切换。暂停、自动播放受阻及主动取消不会拉黑节点。
-- 单块最多换源重试两次，失败后当前请求以原始地址单连接重试一次，并为当前资源降级。地址疑似过期时最多刷新一次合法播放地址。
-- 自动失败只产生当前资源的临时冷却。手动黑名单单独保存；旧版黑名单保留在面板中，只有主动恢复后才生效。
-- 音频独立选源，可开启「音频使用原始备用地址」。诊断导出包含节点、速度和原因，不包含签名、Cookie 或完整播放地址。
+### 1. 数据内嵌，摆脱 GitHub Pages 依赖
+- 502 个 CDN 节点 + 25 个地区数据直接编译进脚本
+- 原版依赖 `kanda-akihito-kun.github.io`，国内部分地区（福建、河南等）无法访问
+- 启动即用，无需等待网络请求，后台静默从 jsDelivr / GitHub Pages 增量更新
 
-直播保留原生下载。本版只修改可识别直播响应的首个 host，并保留完整原始备用节点；可接管的 fetch 硬错误会尝试原始地址，其他协议仍由原生播放器处理回退。未知直播文本和特殊资源直接交给原生通道。
+### 2. 智能运营商匹配
+- 自动识别 CDN 节点名中的运营商标记（`ct`=电信、`cu`=联通、`cm`=移动）
+- 面板新增运营商筛选下拉框
+- 节点列表按运营商排序，同运营商优先
 
-番剧需允许用户脚本在相关框架运行。受 DRM、授权、签名或播放器协议限制的请求会保留原生通道；本脚本不改变账号权限及播放授权。
+### 3. CDN 节点测速
+- 每个地区面板自带 `⚡ 测速` 按钮，并发测试所有节点延迟
+- `🌐 测试全部地区` 全局测速，每个地区抽代表节点，结果按延迟排名
+- 测速时实时显示每个节点的延迟，测完自动同步到下拉框选项
+- 自动选中延迟最低的节点
 
-## 数据更新与手动发布
+### 4. 视频内容验活
+- 拦截 B 站 playurl 响应，提取真实视频分片路径
+- 对测速最快的节点发 GET 请求验证是否真的缓存了该视频
+- 下拉框显示 `✅ 有内容` / `🚫 无内容` 标记
+- 优先选择延迟低且确认有内容的节点
 
-节点内嵌在安装脚本中，后台优先从本 Fork 的 jsDelivr、GitHub 原始文件更新，随后尝试上游。有效数据缓存七天；线上失败时继续使用已有快照。
+### 5. 备份节点多样化（修复强力模式致命缺陷）
+- 原版强力模式把所有 `backup_url` 替换为同一个节点 → 该节点无内容就彻底失败
+- 修复后：`base_url` 用首选节点，`backup_url` 用同地区不同节点做容灾
+- 保留 B 站原有的多 CDN 故障转移能力
 
-**本仓库已停用 GitHub Actions，并移除全部工作流。** 构建、测试、节点维护和版本发布在本地手动完成，不再定时启动任务或依赖 Pages 部署。
+### 6. 节点失败追踪
+- 选中节点后出现 `🚫` 拉黑按钮
+- 播放失败时点击标记，失败 ≥2 次的节点自动跳过
+- 下拉框显示失败计数 `×2`
 
-需要更新节点时运行 `go run update.go`，默认合并有效上游快照和维护镜像列表。第三方子域发现仅在手动设置 `CCB_DISCOVER=1` 时运行。来源失败保留原有成功时间；节点无变化时不重写数据。
+### 7. 构建系统
+- `python script/build.py` 一键构建，把 `data/*.json` 内嵌进脚本
+- 输出 `script/ccb.bundle.user.js`，直接安装到 Tampermonkey
 
-更新完成后运行 `python script/build.py` 和本地验证命令，再将源码、数据与安装脚本作为同一快照提交。手动发布 GitHub Release，附带安装脚本和 2.2.0 回退脚本。插件安装与更新入口仍使用 GitHub 原始文件及 jsDelivr，不依赖构建服务。
+---
 
-## 本地构建与验证
+## 快速说明
 
-需要 Python 3、Node.js 24；更新器和服务端检查需要 Go 1.26 或更高。
+1. 适用范围：网页端 B 站的 **[普通视频、充电视频、直播间、番剧、稍后再看、测速]**；
+2. 使用方法：浏览器右上角 → 油猴插件设置 → 点击 `📺CCB` 打开设置面板；
+3. 开关说明：
+    - **强力替换模式（建议开启）**：强制切换播放源，保留 `backup_url` 多样性做容灾；
+    - **适用直播和番剧**：开启后对直播间及番剧生效；
+4. 番剧页面：需要在油猴设置中关闭"只适用于 top 框架"，详见原版文档；
+5. **改完记得点"应用并刷新"**；
 
-```powershell
-npm ci --ignore-scripts
-npm test
-python -m unittest discover -s script/tests -p 'test_*.py'
+---
+
+## 关于番剧页面
+
+同原版文档。
+
+---
+
+## 关于测速
+
+本 Fork 版内置了 CDN 节点测速和视频内容验活功能，详见「Fork 更新」章节。
+
+测速使用 `fetch` no-cors 模式测量 TCP+TLS 连接延迟，对 B 站服务器产生的额外流量极小。
+
+---
+
+## 构建方式
+
+```bash
+# 安装依赖：Python 3
+
+# 构建脚本
 python script/build.py
-python script/build.py --check
-node --check script/ccb.bundle.user.js
-go test update.go update_test.go
-go test ./server
-npm run test:browser
-# 或使用本地完整检查入口（Go 不在 PATH 时可传 --go <路径>）
-python script/verify.py --browser
+
+# 输出文件
+script/ccb.bundle.user.js   # 直接拖入 Tampermonkey 安装
 ```
 
-Windows 浏览器测试默认使用已安装的 Edge。其他环境执行 `npx playwright install chromium`；也可通过 `CCB_BROWSER` 指定 Chromium 可执行文件。
+---
 
-`python script/build.py --output <路径>` 可指定产物位置。安装脚本由模块和 `data/*.json` 构建，请修改源码模块后重新构建，不要直接修改 bundle。构建时间取数据快照成功时间，保证没有变化时生成字节一致的产物。
+## 项目结构
 
-## 验证范围
+1. `script/` — 前端脚本（ccb.js 模板 + build.py 构建脚本）
+2. `server/` — 后端服务（原作者提供，Fork 未改动）
+3. `data/` — CDN 节点和地区数据（本地手动更新，GitHub Actions 已禁用）
+4. `.github/` — CI/CD workflow
 
-自动测试使用可控媒体响应验证字节一致性、错误处理、并发提升及页面/Worker/XHR 适配。真实 CDN 的内容覆盖、签名兼容及公网速度会随视频和网络变化，无法保证固定速度。冷门视频、高码率视频和直播的实际体验需要安装后结合诊断继续验证。
+---
 
-## 参考与许可
+## 原项目地址
 
-按功能移植上游的 fetch 错误传播、配置缓存、面板并发保护及安全渲染思路，没有整体覆盖上游源码。
+https://github.com/Kanda-Akihito-Kun/ccb
 
-- [CCB 上游改进](https://github.com/Kanda-Akihito-Kun/ccb/commit/755373f93aadf97b3da01a327299eefdb57d886b)
-- [PiliPlus 地址分类与选源](https://github.com/bggRGjQaUbCoE/PiliPlus/blob/main/lib/utils/video_utils.dart)
-- [Bilibili 线程撕裂者](https://github.com/MrTangLuyao/Bilibili-thread-ripper)
+## Fork 地址
 
-本次内核和浏览器适配代码为本 Fork 独立实现。PiliPlus 仅作行为设计参考，未复制其源代码；线程撕裂者仅作调度设计参考。CCB 原项目许可及版权声明见 [LICENSE](LICENSE)。
+https://github.com/maxzrb/bilibiliccb
+
+---
+
+## 致谢
+
+感谢原作者 [鼠鼠今天吃嘉然](https://space.bilibili.com/3220012) 的开源贡献。

@@ -35,42 +35,17 @@ def load_json(filename):
         return json.load(f)
 
 
-def replace_block(content, name, body):
-    start = f"// ==={name}_START==="
-    end = f"// ==={name}_END==="
-    if content.count(start) != 1 or content.count(end) != 1:
-        raise ValueError(f"构建标记缺失或重复：{name}")
-    a = content.index(start)
-    b = content.index(end, a) + len(end)
-    return content[:a] + start + "\n" + body + "\n" + end + content[b:]
-
-
-def validate_data(regions, cdn):
-    if not isinstance(regions, list) or not regions or not all(isinstance(x, str) for x in regions):
-        raise ValueError("地区数据格式错误")
-    if not isinstance(cdn, dict) or not cdn:
-        raise ValueError("CDN 数据不能为空")
-    import re
-    for region, nodes in cdn.items():
-        if region not in regions or not isinstance(nodes, list) or not all(
-            isinstance(x, str) and re.fullmatch(r"[\w.-]+", x, re.ASCII) for x in nodes
-        ):
-            raise ValueError(f"CDN 数据格式错误：{region}")
-
-
-def build(output_file=OUTPUT_FILE):
+def build():
     # 加载数据
     regions = load_json("region.json")
     cdn = load_json("cdn.json")
-    validate_data(regions, cdn)
 
     try:
         info = load_json("info.json")
     except (FileNotFoundError, json.JSONDecodeError):
         info = {}
 
-    # 使用数据成功更新时间，避免没有变化时反复生成不同的安装产物。
-    build_time = info.get("lastSuccessTime") or "1970-01-01T00:00:00Z"
+    build_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     info["buildTime"] = build_time
 
     # 读取模板
@@ -105,20 +80,8 @@ const EMBEDDED = {{
 
     result = content[:start_idx] + embedded_block + "\n" + content[end_idx:]
 
-    def source(name):
-        with open(os.path.join(SCRIPT_DIR, name), encoding="utf-8") as f:
-            return f.read()
-
-    core = source("cdn-core.js")
-    result = replace_block(result, "CORE", core + "\n" + source("browser-runtime.js"))
-    integration = replace_block(source("browser-integration.js"), "WORKER_CORE",
-                                "const workerCore = " + json.dumps(core, ensure_ascii=False) + ";")
-    result = replace_block(result, "INTEGRATION", integration)
-    result = replace_block(result, "PANEL", source("settings-panel.js"))
-
     # 写入输出
-    os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
-    with open(output_file, "w", encoding="utf-8", newline="\n") as f:
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write(result)
 
     # 统计
@@ -126,7 +89,7 @@ const EMBEDDED = {{
     cdn_count = sum(len(nodes) for nodes in cdn.values())
     file_size_kb = len(result.encode("utf-8")) / 1024
 
-    print(f"✅ 构建完成 → {output_file}")
+    print(f"✅ 构建完成 → {OUTPUT_FILE}")
     print(f"   地区数: {region_count}  节点总数: {cdn_count}  文件大小: {file_size_kb:.1f} KB")
     print(f"   构建时间: {build_time}")
 
@@ -165,20 +128,4 @@ if __name__ == "__main__":
         build()  # 先构建一次
         watch()
     else:
-        import argparse
-        parser = argparse.ArgumentParser()
-        parser.add_argument("--output", default=OUTPUT_FILE)
-        parser.add_argument("--check", action="store_true")
-        args = parser.parse_args()
-        if args.check:
-            import tempfile
-            with tempfile.TemporaryDirectory() as tmp:
-                artifact = os.path.join(tmp, "ccb.user.js")
-                build(artifact)
-                with open(artifact, encoding="utf-8") as f:
-                    expected = f.read()
-                with open(args.output, encoding="utf-8") as f:
-                    if f.read() != expected:
-                        raise SystemExit("安装脚本与当前源码或数据不同步，请重新构建")
-        else:
-            build(args.output)
+        build()
